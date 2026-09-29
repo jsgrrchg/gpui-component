@@ -1177,6 +1177,30 @@ mod tests {
     }
 
     #[gpui::test]
+    fn reading_preview_code_blocks_fit_long_lines(cx: &mut TestAppContext) {
+        cx.update(crate::init);
+        let source = format!("```\n{}\n```", "word ".repeat(80));
+        let (content, _, cx) = editor(cx, &source);
+        content.update(cx, |view, cx| {
+            view.mode = MarkdownMode::Preview;
+            cx.notify();
+        });
+        redraw(cx);
+        let before = cx.debug_bounds("markdown-editor-code-block-0").unwrap();
+        let fit = cx
+            .debug_bounds("markdown-editor-code-block-0-fit")
+            .expect("the preview header must offer fit content");
+        cx.simulate_click(fit.center(), gpui::Modifiers::default());
+        redraw(cx);
+        let after = cx.debug_bounds("markdown-editor-code-block-0").unwrap();
+        assert_eq!(after.size.width, before.size.width);
+        assert!(
+            after.size.height > before.size.height * 2.,
+            "{before:?} -> {after:?}"
+        );
+    }
+
+    #[gpui::test]
     fn code_block_copy_keeps_the_rendered_block(cx: &mut TestAppContext) {
         cx.update(crate::init);
         let source = "```rust\nlet x = 1;\n```\n\nend";

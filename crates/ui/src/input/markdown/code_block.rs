@@ -1,18 +1,20 @@
 //! Fenced code blocks for the Markdown editor, ported from Zeron's transcript
-//! code block: a rounded frame, a header with the language and a copy action,
-//! and a monospace body that scrolls horizontally instead of wrapping.
+//! code block: a rounded frame, a header with the language, fit and copy
+//! actions, and a monospace body that scrolls horizontally unless it is fit to
+//! the block's width.
 
 use std::sync::LazyLock;
 
 use gpui::{
-    App, Div, InteractiveElement as _, IntoElement, MouseButton, ParentElement as _, Pixels,
-    ScrollHandle, SharedString, Stateful, StyleRefinement, Styled as _, StyledText, Window, div,
-    prelude::FluentBuilder as _, px, relative,
+    AnyElement, App, Div, InteractiveElement as _, IntoElement, MouseButton, ParentElement as _,
+    Pixels, ScrollHandle, SharedString, Stateful, StyleRefinement, Styled as _, StyledText, Window,
+    div, prelude::FluentBuilder as _, px, relative,
 };
 use markdown::mdast::Node;
 
 use crate::{
-    ActiveTheme as _,
+    ActiveTheme as _, IconName, Selectable as _, Sizable as _,
+    button::{Button, ButtonVariants as _},
     clipboard::Clipboard,
     scroll::horizontal_scroll_area,
     text::{
@@ -90,37 +92,81 @@ impl MarkdownPlugin for CodeBlockPlugin {
             })
             .read(cx)
             .clone();
+        let fit = window.use_keyed_state(SharedString::from(format!("{id}-fit")), cx, |_, _| false);
+        let fit_content = *fit.read(cx);
         let theme = cx.theme();
         let styles = data.block.styles(&theme.highlight_theme);
         let code_size = theme.mono_font_size;
+        let lines = div()
+            .px(px(PADDING_X))
+            .py(px(PADDING_Y))
+            .font_family(theme.mono_font_family.clone())
+            .text_size(code_size)
+            .line_height(relative(LINE_HEIGHT_RATIO))
+            .text_color(theme.foreground)
+            .when(data.code.is_empty(), |this| {
+                this.min_h(code_size * LINE_HEIGHT_RATIO)
+            })
+            .child(StyledText::new(data.code.clone()).with_highlights(styles));
 
         frame(
             key,
             data.lang.clone(),
             data.code.clone(),
-            horizontal_scroll_area(
-                SharedString::from(format!("{id}-body")),
-                &scroll_handle,
-                &StyleRefinement::default(),
-                div()
-                    .min_w_full()
-                    .flex_none()
-                    .px(px(PADDING_X))
-                    .py(px(PADDING_Y))
-                    .font_family(theme.mono_font_family.clone())
-                    .text_size(code_size)
-                    .line_height(relative(LINE_HEIGHT_RATIO))
-                    .text_color(theme.foreground)
-                    .whitespace_nowrap()
-                    .when(data.code.is_empty(), |this| {
-                        this.min_h(code_size * LINE_HEIGHT_RATIO)
-                    })
-                    .child(StyledText::new(data.code.clone()).with_highlights(styles)),
-            ),
+            Some(fit_button(key, fit_content, move |window, cx| {
+                fit.update(cx, |fit, _| *fit = !*fit);
+                window.refresh();
+            })),
+            if fit_content {
+                lines
+                    .w_full()
+                    .min_w_0()
+                    .whitespace_normal()
+                    .into_any_element()
+            } else {
+                horizontal_scroll_area(
+                    SharedString::from(format!("{id}-body")),
+                    &scroll_handle,
+                    &StyleRefinement::default(),
+                    lines.min_w_full().flex_none().whitespace_nowrap(),
+                )
+                .into_any_element()
+            },
             cx,
         )
         .into_any_element()
     }
+}
+
+/// Zeron's fit action: wrap long lines to the block's width instead of
+/// scrolling them horizontally.
+pub(super) fn fit_button(
+    key: usize,
+    fit_content: bool,
+    on_toggle: impl Fn(&mut Window, &mut App) + 'static,
+) -> AnyElement {
+    div()
+        .flex_none()
+        .debug_selector(move || format!("{NAME}-{key}-fit"))
+        // Like copying, fitting leaves a live preview block rendered.
+        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+        .child(
+            Button::new(SharedString::from(format!("{NAME}-{key}-fit")))
+                .icon(IconName::WrapText)
+                .ghost()
+                .xsmall()
+                .selected(fit_content)
+                .tooltip(if fit_content {
+                    "Use horizontal scrolling"
+                } else {
+                    "Fit content"
+                })
+                .on_click(move |_, window, cx| {
+                    cx.stop_propagation();
+                    on_toggle(window, cx);
+                }),
+        )
+        .into_any_element()
 }
 
 /// The line height Zeron uses for code at the theme's code size, rounded to
@@ -129,12 +175,14 @@ pub(super) fn line_height(cx: &App) -> Pixels {
     (cx.theme().mono_font_size * LINE_HEIGHT_RATIO).round()
 }
 
-/// Zeron's code block frame: a header with the language and a copy action
-/// above `body`. `key` identifies the block within its document.
+/// Zeron's code block frame: a header with the language, an optional fit
+/// action and a copy action above `body`. `key` identifies the block within
+/// its document.
 pub(super) fn frame(
     key: usize,
     lang: Option<SharedString>,
     code: SharedString,
+    fit_button: Option<AnyElement>,
     body: impl IntoElement,
     cx: &App,
 ) -> Stateful<Div> {
@@ -173,16 +221,24 @@ pub(super) fn frame(
                         .children(lang),
                 )
                 .child(
-                    // Live preview reveals a block's source on mouse down;
-                    // copying must leave the rendered block in place.
                     div()
                         .flex_none()
-                        .debug_selector(move || format!("{NAME}-{key}-copy"))
-                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .flex()
+                        .items_center()
+                        .gap(px(2.))
+                        .children(fit_button)
                         .child(
-                            Clipboard::new(SharedString::from(format!("{id}-copy")))
-                                .value(code)
-                                .tooltip("Copy"),
+                            // Live preview reveals a block's source on mouse down;
+                            // copying must leave the rendered block in place.
+                            div()
+                                .flex_none()
+                                .debug_selector(move || format!("{NAME}-{key}-copy"))
+                                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                                .child(
+                                    Clipboard::new(SharedString::from(format!("{id}-copy")))
+                                        .value(code)
+                                        .tooltip("Copy"),
+                                ),
                         ),
                 ),
         )

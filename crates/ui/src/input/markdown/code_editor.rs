@@ -124,6 +124,10 @@ struct CodeEditor {
     lang: Option<SharedString>,
     /// The document offset of the code lines and the code they held.
     synced: Option<(usize, SharedString)>,
+    /// Whether long lines wrap to the block's width instead of scrolling.
+    fit_content: bool,
+    /// Visual rows of the wrapped code, measured after the last paint.
+    fit_rows: Option<usize>,
     _subscription: Subscription,
 }
 
@@ -150,8 +154,47 @@ impl CodeEditor {
             document,
             lang,
             synced: None,
+            fit_content: false,
+            fit_rows: None,
             _subscription: subscription,
         }
+    }
+
+    fn toggle_fit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.fit_content = !self.fit_content;
+        self.fit_rows = None;
+        let fit_content = self.fit_content;
+        self.editor.update(cx, |editor, cx| {
+            editor.set_soft_wrap(fit_content, window, cx);
+            editor.set_scroll_offset(point(px(0.), px(0.)), cx);
+        });
+    }
+
+    /// Record the wrapped code's visual rows after the nested editor painted.
+    /// Returns whether the block must be laid out again.
+    fn measure_fit(&mut self, rows: usize, cx: &App) -> bool {
+        if !self.fit_content {
+            return false;
+        }
+        let editor = self.editor.read(cx);
+        let end = editor.value().len();
+        let measured = match (
+            editor.range_to_bounds(&(0..0)),
+            editor.range_to_bounds(&(end..end)),
+            editor.line_height(),
+        ) {
+            (Some(first), Some(last), Some(line_height)) => {
+                ((last.bottom() - first.top()) / line_height).round() as usize
+            }
+            // The last row lies below the viewport: grow until it fits.
+            (Some(_), None, Some(_)) => rows * 2,
+            _ => return false,
+        };
+        if self.fit_rows == Some(measured) {
+            return false;
+        }
+        self.fit_rows = Some(measured);
+        true
     }
 
     /// Mirror the document's code into the nested editor.
@@ -289,7 +332,14 @@ impl EditableCode {
             .read(cx)
             .line_height()
             .unwrap_or_else(|| code_block::line_height(cx));
-        let rows = code.code.split('\n').count();
+        let lines = code.code.split('\n').count();
+        let (fit_content, rows) = editor.read_with(cx, |editor, _| {
+            if editor.fit_content {
+                (true, editor.fit_rows.unwrap_or(lines).max(lines))
+            } else {
+                (false, lines)
+            }
+        });
         let start = self.lines.start;
         let bounds = Rc::new(std::cell::Cell::new(Bounds::<Pixels>::default()));
 
@@ -306,8 +356,16 @@ impl EditableCode {
                 start,
                 code.lang.clone(),
                 code.code.clone(),
+                Some(code_block::fit_button(start, fit_content, {
+                    let editor = editor.clone();
+                    move |window, cx| {
+                        editor.update(cx, |editor, cx| editor.toggle_fit(window, cx));
+                        window.refresh();
+                    }
+                })),
                 div()
                     .debug_selector(move || format!("markdown-code-editor-{start}"))
+                    .relative()
                     .w_full()
                     // The nested editor owns clicks inside the code.
                     .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
@@ -392,6 +450,20 @@ impl EditableCode {
                             .text_size(cx.theme().mono_font_size)
                             .line_height(line_height)
                             .h((line_height * rows as f32 + px(EDITOR_PADDING_Y * 2.)).ceil()),
+                    )
+                    // Wrapped rows are known only once the nested editor has
+                    // laid out at the block's width.
+                    .child(
+                        canvas(
+                            |_, _, _| {},
+                            move |_, _, window, cx| {
+                                if editor.update(cx, |editor, cx| editor.measure_fit(rows, cx)) {
+                                    window.refresh();
+                                }
+                            },
+                        )
+                        .absolute()
+                        .size_full(),
                     ),
                 cx,
             ))
@@ -551,6 +623,67 @@ mod tests {
     #[gpui::test]
     fn shift_wheels_scroll_long_lines(cx: &mut gpui::TestAppContext) {
         assert!((10..400).contains(&offset_after_wheel(cx, 0., -200., true)));
+    }
+
+    #[gpui::test]
+    fn fit_wraps_long_lines_to_the_block_and_back(cx: &mut gpui::TestAppContext) {
+        use crate::input::markdown::tests::{editor, redraw};
+        use gpui::{Modifiers, ScrollDelta};
+
+        cx.update(crate::init);
+        let long = "word ".repeat(80);
+        let source = format!("intro\n\n```\n{long}\n```\n\nend");
+        let (_, state, cx) = editor(cx, &source);
+        let single = cx
+            .debug_bounds("markdown-code-editor-7")
+            .unwrap()
+            .size
+            .height;
+        let fit = cx
+            .debug_bounds("markdown-editor-code-block-7-fit")
+            .expect("the header must offer fit content");
+        cx.simulate_click(fit.center(), Modifiers::default());
+        for _ in 0..4 {
+            redraw(cx);
+        }
+        let body = cx.debug_bounds("markdown-code-editor-7").unwrap();
+        assert!(body.size.height > single * 3., "{single:?} -> {body:?}");
+        let nested = LAST_EDITOR.with(|last| last.borrow().clone()).unwrap();
+        let line_height = nested.read_with(cx, |nested, _| nested.line_height().unwrap());
+        let rows = ((body.size.height - px(EDITOR_PADDING_Y * 2.)) / line_height).round();
+        let last = nested
+            .read_with(cx, |nested, _| {
+                nested.range_to_bounds(&(long.len()..long.len()))
+            })
+            .expect("the last wrapped row must be visible");
+        assert!(
+            last.bottom() <= body.bottom(),
+            "{rows} rows, last {last:?}, body {body:?}"
+        );
+
+        // Wrapped code no longer scrolls sideways, and the source is unchanged.
+        cx.simulate_event(ScrollWheelEvent {
+            position: body.origin + point(px(20.), px(20.)),
+            delta: ScrollDelta::Pixels(point(px(-200.), px(0.))),
+            ..Default::default()
+        });
+        redraw(cx);
+        assert_eq!(
+            nested.read_with(cx, |nested, _| nested.scroll_offset()),
+            point(px(0.), px(0.))
+        );
+        assert_eq!(
+            state.read_with(cx, |state, _| state.value()).as_ref(),
+            source
+        );
+
+        let fit = cx.debug_bounds("markdown-editor-code-block-7-fit").unwrap();
+        cx.simulate_click(fit.center(), Modifiers::default());
+        for _ in 0..4 {
+            redraw(cx);
+        }
+        let body = cx.debug_bounds("markdown-code-editor-7").unwrap();
+        assert_eq!(body.size.height, single);
     }
 
     #[test]
