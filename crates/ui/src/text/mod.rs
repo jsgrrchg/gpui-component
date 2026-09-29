@@ -15,6 +15,7 @@ mod window_selection;
 
 use gpui::{App, ElementId, IntoElement, RenderOnce, SharedString, Window};
 pub use markdown_ext::*;
+pub(crate) use node::{CodeBlock, Span};
 pub use state::*;
 pub use style::*;
 pub use text_view::*;

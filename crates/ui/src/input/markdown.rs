@@ -22,6 +22,8 @@ use crate::{
     text::{TextView, TextViewStyle},
 };
 
+mod code_block;
+
 /// Presentation of a Markdown document. All modes share the same editor state.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum MarkdownMode {
@@ -77,6 +79,7 @@ impl Render for MarkdownReadingPreview {
             self.state.read(cx).value(),
         )
         .style(markdown_style(cx))
+        .markdown_extensions(code_block::extensions())
         .selectable(true)
         .scrollable(true)
         .size_full()
@@ -583,6 +586,7 @@ impl EditorDisplayProvider for MarkdownDisplay {
                     let tasks = tasks.clone();
                     let view = TextView::markdown(SharedString::from(id.clone()), source.clone())
                         .style(markdown_style(cx).paragraph_gap(rems(0.25)))
+                        .markdown_extensions(code_block::extensions())
                         .on_task_toggle(move |offset, checked, window, cx| {
                             if let Some(task) = tasks
                                 .iter()
@@ -1023,6 +1027,30 @@ mod tests {
                 .read_with(cx, |state, _| state.value())
                 .contains("edit ")
         );
+    }
+
+    #[gpui::test]
+    fn code_block_copy_keeps_the_rendered_block(cx: &mut TestAppContext) {
+        cx.update(crate::init);
+        let source = "```rust\nlet x = 1;\n```\n\nend";
+        let (_, state, cx) = editor(cx, source);
+        let copy = cx
+            .debug_bounds("markdown-editor-code-block-0-copy")
+            .expect("code block header must have a copy action");
+        cx.simulate_click(copy.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+        assert_eq!(
+            cx.read_from_clipboard()
+                .and_then(|item| item.text())
+                .as_deref(),
+            Some("let x = 1;")
+        );
+        assert_eq!(
+            state.read_with(cx, |state, _| state.value()).as_ref(),
+            source
+        );
+        cx.update(|window, cx| window.draw(cx).clear());
+        assert!(cx.debug_bounds("markdown-live-block-0").is_some());
     }
 
     #[gpui::test]
