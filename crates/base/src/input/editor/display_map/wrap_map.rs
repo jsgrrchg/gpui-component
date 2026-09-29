@@ -23,6 +23,14 @@ pub(super) struct WrapMap {
 }
 
 impl WrapMap {
+    pub(super) fn set_projection(
+        &mut self,
+        replacements: Vec<crate::input::DisplayReplacement>,
+        blocks: Vec<crate::input::display::DisplayBlockLayout>,
+        cx: &mut App,
+    ) -> bool {
+        self.wrapper.set_projection(replacements, blocks, cx)
+    }
     pub(super) fn new(font: Font, font_size: Pixels, wrap_width: Option<Pixels>) -> Self {
         Self {
             wrapper: TextWrapper::new(font, font_size, wrap_width),

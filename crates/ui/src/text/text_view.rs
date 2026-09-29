@@ -22,6 +22,8 @@ pub(crate) type CodeBlockActionsFn =
 pub(crate) type LinkClickHandlerFn =
     dyn Fn(&SharedString, &ClickEvent, &mut Window, &mut App) + Send + Sync;
 
+pub(crate) type TaskToggleHandlerFn = dyn Fn(usize, bool, &mut Window, &mut App) + Send + Sync;
+
 pub(crate) fn handle_link_click(
     handler: &Option<Arc<LinkClickHandlerFn>>,
     url: SharedString,
@@ -71,6 +73,8 @@ pub struct TextView {
     scrollable: bool,
     code_block_actions: Option<Arc<CodeBlockActionsFn>>,
     link_click_handler: Option<Arc<LinkClickHandlerFn>>,
+    task_toggle_handler: Option<Arc<TaskToggleHandlerFn>>,
+    task_list_readonly: bool,
     markdown_extensions: Arc<MarkdownExtensions>,
 }
 
@@ -112,6 +116,8 @@ impl TextView {
             scrollable: false,
             code_block_actions: None,
             link_click_handler: None,
+            task_toggle_handler: None,
+            task_list_readonly: false,
             markdown_extensions: Arc::default(),
         }
     }
@@ -130,6 +136,8 @@ impl TextView {
             scrollable: false,
             code_block_actions: None,
             link_click_handler: None,
+            task_toggle_handler: None,
+            task_list_readonly: false,
             markdown_extensions: Arc::default(),
         }
     }
@@ -148,6 +156,8 @@ impl TextView {
             scrollable: false,
             code_block_actions: None,
             link_click_handler: None,
+            task_toggle_handler: None,
+            task_list_readonly: false,
             markdown_extensions: Arc::default(),
         }
     }
@@ -214,6 +224,22 @@ impl TextView {
         F: Fn(&SharedString, &ClickEvent, &mut Window, &mut App) + Send + Sync + 'static,
     {
         self.link_click_handler = Some(Arc::new(handler));
+        self
+    }
+
+    /// Handle a task checkbox toggle, receiving its list item's UTF-8 source
+    /// offset and new checked state. The owner applies the change to its source.
+    pub fn on_task_toggle<F>(mut self, handler: F) -> Self
+    where
+        F: Fn(usize, bool, &mut Window, &mut App) + Send + Sync + 'static,
+    {
+        self.task_toggle_handler = Some(Arc::new(handler));
+        self
+    }
+
+    /// Disable task controls while retaining their rendered checked state.
+    pub fn task_list_readonly(mut self, readonly: bool) -> Self {
+        self.task_list_readonly = readonly;
         self
     }
 
@@ -331,6 +357,8 @@ impl Element for TextView {
         state.update(cx, |state, cx| {
             state.code_block_actions = self.code_block_actions.clone();
             state.link_click_handler = self.link_click_handler.clone();
+            state.task_toggle_handler = self.task_toggle_handler.clone();
+            state.task_list_readonly = self.task_list_readonly;
             state.set_markdown_extensions(self.markdown_extensions.clone(), cx);
             state.selectable = self.selectable;
             state.selection_format = self.selection_format;

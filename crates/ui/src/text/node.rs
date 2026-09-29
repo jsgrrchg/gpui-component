@@ -7,20 +7,24 @@ use std::{
 
 use gpui::{
     AnyElement, App, DefiniteLength, Div, ElementId, FontStyle, FontWeight, Half, HighlightStyle,
-    Hsla, InteractiveElement as _, IntoElement, Length, ObjectFit, Overflow, ParentElement,
-    ScrollHandle, SharedString, SharedUri, StatefulInteractiveElement, Styled, StyledImage as _,
-    WhiteSpace, Window, div, img, prelude::FluentBuilder as _, px, relative, rems,
+    Hsla, InteractiveElement as _, IntoElement, Length, MouseButton, ObjectFit, Overflow,
+    ParentElement, ScrollHandle, SharedString, SharedUri, StatefulInteractiveElement, Styled,
+    StyledImage as _, WhiteSpace, Window, div, img, prelude::FluentBuilder as _, px, relative,
+    rems,
 };
 use markdown::mdast;
 use ropey::Rope;
 
 use crate::{
-    ActiveTheme as _, Icon, IconName, StyledExt, h_flex,
+    ActiveTheme as _, Disableable as _, Icon, IconName, StyledExt,
+    checkbox::Checkbox,
+    h_flex,
     highlighter::{HighlightTheme, LanguageRegistry, SyntaxHighlighter},
     input::{InputEdit, Point, RopeExt as _},
     scroll::horizontal_scroll_area,
     text::{
         CodeBlockActionsFn, LinkClickHandlerFn, MarkdownExtensions, MarkdownNode,
+        TaskToggleHandlerFn,
         document::NodeRenderOptions,
         inline::{Inline, InlineState},
         inline_flow::{InlineFlow, InlineFlowItem},
@@ -1280,6 +1284,8 @@ pub(crate) struct NodeContext {
     pub(crate) style: TextViewStyle,
     pub(crate) code_block_actions: Option<Arc<CodeBlockActionsFn>>,
     pub(crate) link_click_handler: Option<Arc<LinkClickHandlerFn>>,
+    pub(crate) task_toggle_handler: Option<Arc<TaskToggleHandlerFn>>,
+    pub(crate) task_list_readonly: bool,
     pub(crate) markdown_extensions: Arc<MarkdownExtensions>,
 }
 
@@ -1771,6 +1777,8 @@ impl BlockNode {
         ix: usize,
         options: NodeRenderOptions,
         checked: Option<bool>,
+        task_offset: usize,
+        node_cx: &NodeContext,
         cx: &mut App,
     ) -> Div {
         h_flex()
@@ -1784,6 +1792,26 @@ impl BlockNode {
                 this.child(list_item_prefix(ix, options.ordered, options.depth))
             })
             .when_some(checked, |this, checked| {
+                if let Some(handler) = node_cx.task_toggle_handler.clone() {
+                    return this.child(
+                        div()
+                            .debug_selector(|| "markdown-live-task-checkbox".into())
+                            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                            .child(
+                                div()
+                                    .debug_selector(move || format!("markdown-task-{task_offset}"))
+                                    .child(
+                                        Checkbox::new(("task", task_offset))
+                                            .checked(checked)
+                                            .tab_stop(false)
+                                            .disabled(node_cx.task_list_readonly)
+                                            .on_click(move |checked, window, cx| {
+                                                handler(task_offset, *checked, window, cx);
+                                            }),
+                                    ),
+                            ),
+                    );
+                }
                 // Todo list checkbox
                 this.child(
                     div()
@@ -1819,6 +1847,7 @@ impl BlockNode {
                 children,
                 spread,
                 checked,
+                span,
                 ..
             } => v_flex()
                 .id(("li", options.ix))
@@ -1865,7 +1894,13 @@ impl BlockNode {
                                 }
 
                                 items.push(Self::render_list_item_row(
-                                    text, ix, options, *checked, cx,
+                                    text,
+                                    ix,
+                                    options,
+                                    *checked,
+                                    span.map_or(0, |span| span.start),
+                                    node_cx,
+                                    cx,
                                 ));
                             }
                             BlockNode::List { .. } => {
@@ -1902,7 +1937,13 @@ impl BlockNode {
 
                                 if child_ix == 0 {
                                     items.push(Self::render_list_item_row(
-                                        block, ix, options, *checked, cx,
+                                        block,
+                                        ix,
+                                        options,
+                                        *checked,
+                                        span.map_or(0, |span| span.start),
+                                        node_cx,
+                                        cx,
                                     ));
                                 } else {
                                     // Indent continuation blocks to align with a

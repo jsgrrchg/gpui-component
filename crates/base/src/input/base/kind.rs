@@ -75,6 +75,9 @@ impl MultiLineMode for EditorMode {}
 /// during an edit. Adding a field an editor renders belongs here and leaves
 /// the engine's callbacks alone.
 pub trait InputExtras: Default + 'static {
+    fn display_provider(&self) -> Option<super::SharedEditorDisplayProvider> {
+        None
+    }
     /// Decoration ranges to paint, innermost collection first.
     fn decoration_layers(&self) -> Vec<&[TextDecoration]> {
         Vec::new()
@@ -146,6 +149,11 @@ pub trait InputModeKind: sealed::Sealed + Sized + 'static {
     /// number stepping. Keeping those here means a form full of text fields
     /// does not carry an editor's worth of machinery.
     type Extras: InputExtras;
+
+    /// A source edit for Enter when this mode has structured line prefixes.
+    fn newline_edit(_state: &InputBaseState<Self>) -> Option<(std::ops::Range<usize>, String)> {
+        None
+    }
 
     /// Drives the syntax highlighter after the text changed.
     ///
@@ -324,6 +332,8 @@ impl InputModeKind for TextareaMode {
 
 /// What a code editor adds on top of multi-line text: language features.
 pub struct EditorExtras {
+    pub(crate) display_provider: Option<super::SharedEditorDisplayProvider>,
+    pub(crate) markdown_editing: bool,
     pub(crate) lsp: Lsp,
     pub(crate) decorations: DecorationCollections,
     pub(crate) inline_completion: InlineCompletion,
@@ -336,6 +346,8 @@ pub struct EditorExtras {
 impl Default for EditorExtras {
     fn default() -> Self {
         Self {
+            display_provider: None,
+            markdown_editing: false,
             lsp: Lsp::default(),
             decorations: DecorationCollections::default(),
             inline_completion: InlineCompletion::default(),

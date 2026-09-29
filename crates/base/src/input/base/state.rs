@@ -1317,7 +1317,12 @@ impl<M: InputModeKind> InputBaseState<M> {
             if let Some(line) = self.display_map.line(row)
                 && let Some(range) = line.wrapped_lines.get(wrap_point.local_row)
             {
-                let visual_start = logical_start + range.start;
+                let visual_start = logical_start
+                    + line
+                        .projection
+                        .as_ref()
+                        .map(|p| p.display_to_source(range.start))
+                        .unwrap_or(range.start);
                 if self.cursor() != visual_start {
                     return visual_start;
                 }
@@ -1345,7 +1350,12 @@ impl<M: InputModeKind> InputBaseState<M> {
             if let Some(line) = self.display_map.line(row)
                 && let Some(range) = line.wrapped_lines.get(wrap_point.local_row)
             {
-                let visual_end = logical_start + range.end;
+                let visual_end = logical_start
+                    + line
+                        .projection
+                        .as_ref()
+                        .map(|p| p.display_to_source(range.end))
+                        .unwrap_or(range.end);
                 if self.cursor() != visual_end {
                     return visual_end;
                 }
@@ -1556,16 +1566,20 @@ impl<M: InputModeKind> InputBaseState<M> {
         let insert_newline = self.is_multi_line() && (!self.submit_on_enter || action.shift);
 
         if insert_newline {
-            // Get current line indent
-            let indent = if self.is_code_editor() {
-                self.indent_of_next_line()
+            if !action.shift
+                && let Some((range, new_text)) = M::newline_edit(self)
+            {
+                let range_utf16 = self.range_to_utf16(&range);
+                self.replace_text_in_range_silent(Some(range_utf16), &new_text, window, cx);
             } else {
-                "".to_string()
-            };
-
-            // Add newline and indent
-            let new_line_text = format!("\n{}", indent);
-            self.replace_text_in_range_silent(None, &new_line_text, window, cx);
+                let indent = if self.is_code_editor() {
+                    self.indent_of_next_line()
+                } else {
+                    "".to_string()
+                };
+                let new_line_text = format!("\n{}", indent);
+                self.replace_text_in_range_silent(None, &new_line_text, window, cx);
+            }
             self.pause_blink_cursor(cx);
         } else {
             // Single line input or submit-on-enter: just emit the event

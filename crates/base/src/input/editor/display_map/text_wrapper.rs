@@ -9,7 +9,8 @@ use smallvec::SmallVec;
 use sum_tree::{Bias, Dimensions, SumTree};
 
 use crate::input::{
-    Point as TreeSitterPoint, RopeExt,
+    DisplayReplacement, Point as TreeSitterPoint, RopeExt,
+    display::{DisplayBlockLayout, LineProjection},
     layout::{LastLayout, WhitespaceIndicators},
 };
 
@@ -26,6 +27,7 @@ pub enum WrappingIndent {
 /// A line with soft wrapped lines info.
 #[derive(Debug, Clone)]
 pub(crate) struct LineItem {
+    pub(crate) projection: Option<LineProjection>,
     /// The byte length of the line, without the end `\n`.
     len: usize,
     /// Number of leading characters of the line reserved as indentation for continuation wrapped
@@ -101,7 +103,7 @@ impl sum_tree::Item for LineItem {
             buffer_rows: 1,
             wrap_rows: self.lines_len(),
             bytes: self.len(),
-            max_line_len: self.len(),
+            max_line_len: self.wrapped_lines.last().map_or(0, |range| range.end),
             longest_row: 0,
         }
     }
@@ -135,10 +137,45 @@ impl<'a> sum_tree::Dimension<'a, LineSummary> for WrapRows {
     }
 }
 
+/// Visit only changed entries in two sorted projection snapshots.
+fn changed_items<'a, T: PartialEq>(
+    before: &'a [T],
+    after: &'a [T],
+    key: impl Fn(&T) -> (usize, usize),
+) -> Vec<&'a T> {
+    let mut changed = Vec::new();
+    let (mut old, mut new) = (0, 0);
+    while old < before.len() && new < after.len() {
+        match key(&before[old]).cmp(&key(&after[new])) {
+            std::cmp::Ordering::Less => {
+                changed.push(&before[old]);
+                old += 1;
+            }
+            std::cmp::Ordering::Greater => {
+                changed.push(&after[new]);
+                new += 1;
+            }
+            std::cmp::Ordering::Equal => {
+                if before[old] != after[new] {
+                    changed.push(&before[old]);
+                    changed.push(&after[new]);
+                }
+                old += 1;
+                new += 1;
+            }
+        }
+    }
+    changed.extend(&before[old..]);
+    changed.extend(&after[new..]);
+    changed
+}
+
 /// Used to prepare the text with soft wrap to be get lines to displayed in the Editor.
 ///
 /// After use lines to calculate the scroll size of the Editor.
 pub(crate) struct TextWrapper {
+    replacements: Vec<DisplayReplacement>,
+    blocks: Vec<DisplayBlockLayout>,
     text: Rope,
     font: Font,
     font_size: Pixels,
@@ -155,6 +192,8 @@ pub(crate) struct TextWrapper {
 impl TextWrapper {
     pub(crate) fn new(font: Font, font_size: Pixels, wrap_width: Option<Pixels>) -> Self {
         Self {
+            replacements: Vec::new(),
+            blocks: Vec::new(),
             text: Rope::new(),
             font,
             font_size,
@@ -168,6 +207,88 @@ impl TextWrapper {
     #[inline]
     pub(crate) fn set_default_text(&mut self, text: &Rope) {
         self.text = text.clone();
+    }
+
+    pub(crate) fn set_projection(
+        &mut self,
+        replacements: Vec<DisplayReplacement>,
+        blocks: Vec<DisplayBlockLayout>,
+        cx: &mut App,
+    ) -> bool {
+        let mut line_wrapper = cx
+            .text_system()
+            .line_wrapper(self.font.clone(), self.font_size);
+        self._set_projection(replacements, blocks, &mut |line, width| {
+            line_wrapper
+                .wrap_line(&[LineFragment::text(line)], width)
+                .collect()
+        })
+    }
+
+    fn _set_projection<F>(
+        &mut self,
+        mut replacements: Vec<DisplayReplacement>,
+        mut blocks: Vec<DisplayBlockLayout>,
+        wrap_line: &mut F,
+    ) -> bool
+    where
+        F: FnMut(&str, Pixels) -> Vec<gpui::Boundary>,
+    {
+        replacements.sort_by_key(|replacement| (replacement.range.start, replacement.range.end));
+        let mut end = 0;
+        replacements.retain(|replacement| {
+            if replacement.range.start < end || replacement.range.end < replacement.range.start {
+                return false;
+            }
+            end = replacement.range.end;
+            true
+        });
+        blocks.sort_by_key(|block| (block.lines.start, block.lines.end));
+        if self.replacements == replacements && self.blocks == blocks {
+            return false;
+        }
+
+        let mut dirty = Vec::<Range<usize>>::new();
+        for replacement in changed_items(&self.replacements, &replacements, |replacement| {
+            (replacement.range.start, replacement.range.end)
+        }) {
+            let first = self
+                .text
+                .offset_to_point(replacement.range.start.min(self.text.len()))
+                .row;
+            let last = self
+                .text
+                .offset_to_point(replacement.range.end.saturating_sub(1).min(self.text.len()))
+                .row;
+            dirty.push(first..last + 1);
+        }
+        for block in changed_items(&self.blocks, &blocks, |block| {
+            (block.lines.start, block.lines.end)
+        }) {
+            dirty.push(block.lines.start..block.lines.end.min(self.text.lines_len()));
+        }
+        self.replacements = replacements;
+        self.blocks = blocks;
+        if self._initialized {
+            dirty.sort_by_key(|range| range.start);
+            let mut merged = Vec::<Range<usize>>::new();
+            for range in dirty.into_iter().filter(|range| !range.is_empty()) {
+                if let Some(last) = merged.last_mut()
+                    && range.start <= last.end
+                {
+                    last.end = last.end.max(range.end);
+                } else {
+                    merged.push(range);
+                }
+            }
+            let text = self.text.clone();
+            for rows in merged {
+                let bytes = text.line_start_offset(rows.start)..text.line_end_offset(rows.end - 1);
+                let source = Rope::from(text.slice(bytes.clone()));
+                self._update(&text, &bytes, &source, wrap_line);
+            }
+        }
+        true
     }
 
     /// Get reference to the rope text.
@@ -328,12 +449,88 @@ impl TextWrapper {
         let new_end_offset = changed_text.line_end_offset(new_end_row);
         let new_range = new_start_offset..new_end_offset;
 
+        // Keep the previous snapshot in the edited document's coordinates.
+        // Otherwise diffing the next snapshot can miss surviving hidden rows
+        // when a deletion moves a block before its old line range.
+        if !self.lines.is_empty()
+            && !ropey::extra::esoterica::ropes_are_instances(&self.text, changed_text)
+        {
+            let removed = range.end - range.start;
+            for replacement in &mut self.replacements {
+                let old = &replacement.range;
+                let from = if old.start < range.start {
+                    old.start
+                } else if old.start >= range.end {
+                    old.start - removed + new_text.len()
+                } else {
+                    range.start
+                };
+                let to = if old.end <= range.start {
+                    old.end
+                } else if old.end >= range.end {
+                    old.end - removed + new_text.len()
+                } else {
+                    range.start + new_text.len()
+                };
+                replacement.range = from..to.max(from);
+            }
+            let removed_rows = end_row - start_row;
+            let inserted_rows = new_end_row - new_start_row;
+            for block in &mut self.blocks {
+                let first = if block.lines.start <= start_row {
+                    block.lines.start
+                } else if block.lines.start > end_row {
+                    block.lines.start - removed_rows + inserted_rows
+                } else {
+                    new_start_row
+                };
+                let last = if block.lines.end <= start_row {
+                    block.lines.end
+                } else if block.lines.end > end_row + 1 {
+                    block.lines.end - removed_rows + inserted_rows
+                } else {
+                    new_end_row + 1
+                };
+                block.lines = first..last;
+            }
+        }
+
         let mut new_lines = vec![];
         let wrap_width = self.wrap_width;
 
         // line not contains `\n`.
-        for line in Rope::from(changed_text.slice(new_range)).iter_lines() {
-            let line_str = line.to_string();
+        let mut line_start = new_start_offset;
+        for (line_index, line) in Rope::from(changed_text.slice(new_range))
+            .iter_lines()
+            .enumerate()
+        {
+            let source = line.to_string();
+            let projection = LineProjection::new(&source, line_start, &self.replacements);
+            let line_str = projection
+                .as_ref()
+                .map(|p| p.text.as_ref())
+                .unwrap_or(&source);
+            let row = new_start_row + line_index;
+            let block_index = self.blocks.partition_point(|block| block.lines.end <= row);
+            let block = self
+                .blocks
+                .get(block_index)
+                .filter(|block| block.lines.contains(&row));
+            line_start += line.len() + 1;
+            if let Some(block) = block {
+                let rows = if new_start_row + line_index == block.lines.start {
+                    block.rows
+                } else {
+                    0
+                };
+                new_lines.push(LineItem {
+                    len: line.len(),
+                    projection: None,
+                    indent: 0,
+                    wrapped_lines: std::iter::repeat_n(0..0, rows).collect(),
+                });
+                continue;
+            }
             let mut wrapped_lines = SmallVec::<[Range<usize>; 1]>::new();
             let mut prev_boundary_ix = 0;
             let mut indent_chars = 0;
@@ -371,10 +568,11 @@ impl TextWrapper {
 
             // Reset of the line
             if !line_str[prev_boundary_ix..].is_empty() || prev_boundary_ix == 0 {
-                wrapped_lines.push(prev_boundary_ix..line.len());
+                wrapped_lines.push(prev_boundary_ix..line_str.len());
             }
 
             new_lines.push(LineItem {
+                projection,
                 len: line.len(),
                 indent: indent_chars,
                 wrapped_lines,
@@ -421,6 +619,11 @@ impl TextWrapper {
         };
 
         let local_offset = offset.saturating_sub(start);
+        let local_offset = line
+            .projection
+            .as_ref()
+            .map(|p| p.source_to_display(local_offset))
+            .unwrap_or(local_offset);
         for (ix, range) in line.wrapped_lines.iter().enumerate() {
             if range.contains(&local_offset) {
                 return WrapDisplayPoint::new(
@@ -453,7 +656,13 @@ impl TextWrapper {
         let line_start = self.text.line_start_offset(row);
         let local_row = point.row.saturating_sub(wrapped_row);
         if let Some(range) = line.wrapped_lines.get(local_row) {
-            line_start + (range.start + point.column).min(range.end)
+            let offset = (range.start + point.column).min(range.end);
+            line_start
+                + line
+                    .projection
+                    .as_ref()
+                    .map(|p| p.display_to_source(offset))
+                    .unwrap_or(offset)
         } else {
             // If not found, return the end of the line.
             line_start + line.len()
@@ -500,6 +709,7 @@ impl WrapDisplayPoint {
 
 /// The layout info of a line with soft wrapped lines.
 pub(crate) struct LineLayout {
+    projection: Option<LineProjection>,
     /// Total bytes length of this line.
     len: usize,
     /// The soft wrapped lines of this line (Include the first line).
@@ -516,6 +726,7 @@ pub(crate) struct LineLayout {
 impl LineLayout {
     pub(crate) fn new() -> Self {
         Self {
+            projection: None,
             len: 0,
             longest_width: px(0.),
             wrapped_lines: SmallVec::new(),
@@ -529,6 +740,23 @@ impl LineLayout {
     pub(crate) fn wrap_indent(mut self, wrap_indent: Pixels) -> Self {
         self.wrap_indent = wrap_indent;
         self
+    }
+
+    pub(crate) fn projection(
+        mut self,
+        projection: Option<LineProjection>,
+        source_len: usize,
+    ) -> Self {
+        self.projection = projection;
+        self.len = source_len;
+        self
+    }
+
+    fn source_index(&self, offset: usize) -> usize {
+        self.projection
+            .as_ref()
+            .map(|p| p.display_to_source(offset))
+            .unwrap_or(offset)
     }
 
     /// The pixel indent applied to the given visual line, relative to the line's
@@ -603,6 +831,11 @@ impl LineLayout {
         last_layout: &LastLayout,
         line_end_affinity: bool,
     ) -> Option<Point<Pixels>> {
+        let offset = self
+            .projection
+            .as_ref()
+            .map(|p| p.source_to_display(offset))
+            .unwrap_or(offset);
         let mut acc_len = 0;
         let mut offset_y = px(0.);
 
@@ -655,12 +888,12 @@ impl LineLayout {
                     ix = ix.saturating_sub(c_len);
                 }
 
-                return acc_len + ix;
+                return self.source_index(acc_len + ix);
             }
             acc_len += line.text.len();
         }
 
-        acc_len
+        self.source_index(acc_len)
     }
 
     /// Get the index for the given position (x, y) in this line layout.
@@ -685,7 +918,7 @@ impl LineLayout {
                     let c_len = line.text.chars().last().map(|c| c.len_utf8()).unwrap_or(0);
                     ix = ix.saturating_sub(c_len);
                 }
-                return Some(offset + ix);
+                return Some(self.source_index(offset + ix));
             }
 
             offset += line.text.len();
@@ -707,7 +940,7 @@ impl LineLayout {
             let line_bottom = line_top + last_layout.line_height;
             if pos.y >= line_top && pos.y < line_bottom {
                 let ix = line.index_for_x(pos.x - x_offset - self.line_indent(i))?;
-                return Some(offset + ix);
+                return Some(self.source_index(offset + ix));
             }
 
             offset += line.text.len();
@@ -774,6 +1007,236 @@ mod tests {
     use std::rc::Rc;
 
     use gpui::{Boundary, FontFeatures, FontStyle, FontWeight, px};
+
+    #[test]
+    fn moving_active_tokens_rewraps_only_changed_lines() {
+        let text = Rope::from("**text**\n".repeat(1_000));
+        let replacements = (0..1_000)
+            .flat_map(|line| {
+                let start = line * 9;
+                [
+                    DisplayReplacement {
+                        range: start..start + 2,
+                        text: "".into(),
+                    },
+                    DisplayReplacement {
+                        range: start + 6..start + 8,
+                        text: "".into(),
+                    },
+                ]
+            })
+            .collect::<Vec<_>>();
+        let mut wrapper = TextWrapper::new(test_font(), px(14.), Some(px(500.)));
+        let mut shaped = Vec::new();
+        wrapper._set_projection(replacements.clone(), vec![], &mut |_, _| vec![]);
+        wrapper._update(&text, &(0..text.len()), &text, &mut |_, _| vec![]);
+        wrapper._initialized = true;
+        let revealed = replacements
+            .iter()
+            .filter(|replacement| replacement.range.start / 9 != 5)
+            .cloned()
+            .collect();
+        wrapper._set_projection(revealed, vec![], &mut |line, _| {
+            shaped.push(line.to_owned());
+            vec![]
+        });
+        assert_eq!(shaped, ["**text**"]);
+        shaped.clear();
+        let moved = replacements
+            .iter()
+            .filter(|replacement| replacement.range.start / 9 != 900)
+            .cloned()
+            .collect();
+        wrapper._set_projection(moved, vec![], &mut |line, _| {
+            shaped.push(line.to_owned());
+            vec![]
+        });
+        assert_eq!(shaped, ["text", "**text**"]);
+        assert_eq!(
+            wrapper
+                .line(899)
+                .unwrap()
+                .projection
+                .as_ref()
+                .unwrap()
+                .text
+                .as_ref(),
+            "text"
+        );
+        assert!(wrapper.line(900).unwrap().projection.is_none());
+        assert_eq!(wrapper.lines_count(), text.lines_len());
+    }
+
+    #[test]
+    fn block_measurements_and_reveals_rewrap_only_the_block() {
+        let text = Rope::from("before\n```\ncode\n```\nafter");
+        let mut wrapper = TextWrapper::new(test_font(), px(14.), Some(px(500.)));
+        wrapper._update(&text, &(0..text.len()), &text, &mut |_, _| vec![]);
+        wrapper._initialized = true;
+        wrapper._set_projection(
+            vec![],
+            vec![DisplayBlockLayout {
+                lines: 1..4,
+                rows: 6,
+            }],
+            &mut |_, _| vec![],
+        );
+        assert_eq!(wrapper.len(), 8);
+        wrapper._set_projection(
+            vec![],
+            vec![DisplayBlockLayout {
+                lines: 1..4,
+                rows: 8,
+            }],
+            &mut |_, _| vec![],
+        );
+        assert_eq!(wrapper.len(), 10);
+        let mut shaped = Vec::new();
+        wrapper._set_projection(vec![], vec![], &mut |line, _| {
+            shaped.push(line.to_owned());
+            vec![]
+        });
+        assert_eq!(shaped, ["```", "code", "```"]);
+        assert_eq!(wrapper.len(), 5);
+        assert_eq!(wrapper.text(), &text);
+    }
+
+    #[test]
+    fn projection_ranges_follow_multiline_edits_before_revealing_source() {
+        for (last_row, inserted) in [(4, ""), (0, "new\nlines\n"), (2, "new\n"), (6, "")] {
+            let mut text = Rope::from("before\nbefore\nbefore\n> a\n> b\n> c\n**tail**");
+            let tail = text.line_start_offset(6);
+            let mut wrapper = TextWrapper::new(test_font(), px(14.), None);
+            wrapper.blocks = vec![DisplayBlockLayout {
+                lines: 3..6,
+                rows: 5,
+            }];
+            wrapper.replacements = vec![
+                DisplayReplacement {
+                    range: tail..tail + 2,
+                    text: "".into(),
+                },
+                DisplayReplacement {
+                    range: tail + 6..tail + 8,
+                    text: "".into(),
+                },
+            ];
+            wrapper._update(&text, &(0..text.len()), &text, &mut |_, _| vec![]);
+            wrapper._initialized = true;
+            let range = 0..text.line_start_offset(last_row);
+            text.replace(range.clone(), inserted);
+            wrapper._update(&text, &range, &Rope::from(inserted), &mut |_, _| vec![]);
+
+            let rows = text
+                .iter_lines()
+                .enumerate()
+                .filter_map(|(row, line)| line.to_string().starts_with('>').then_some(row))
+                .collect::<Vec<_>>();
+            let blocks = rows
+                .first()
+                .zip(rows.last())
+                .map(|(first, last)| DisplayBlockLayout {
+                    lines: *first..last + 1,
+                    rows: 5,
+                })
+                .into_iter()
+                .collect::<Vec<_>>();
+            let tail = text.to_string().find("**tail**").unwrap();
+            let replacements = vec![
+                DisplayReplacement {
+                    range: tail..tail + 2,
+                    text: "".into(),
+                },
+                DisplayReplacement {
+                    range: tail + 6..tail + 8,
+                    text: "".into(),
+                },
+            ];
+            wrapper._set_projection(replacements.clone(), blocks.clone(), &mut |_, _| vec![]);
+            let mut fresh = TextWrapper::new(test_font(), px(14.), None);
+            fresh.blocks = blocks;
+            fresh.replacements = replacements;
+            fresh._update(&text, &(0..text.len()), &text, &mut |_, _| vec![]);
+            assert_eq!(wrapper.len(), fresh.len());
+            for row in 0..text.lines_len() {
+                let actual = wrapper.line(row).unwrap();
+                let expected = fresh.line(row).unwrap();
+                assert_eq!(actual.wrapped_lines, expected.wrapped_lines);
+                assert_eq!(
+                    actual.projection.as_ref().map(|p| &p.text),
+                    expected.projection.as_ref().map(|p| &p.text)
+                );
+            }
+
+            wrapper._set_projection(vec![], vec![], &mut |_, _| vec![]);
+            assert_eq!(wrapper.lines_count(), text.lines_len());
+            assert_eq!(wrapper.len(), text.lines_len());
+            for row in 0..text.lines_len() {
+                let line = wrapper.line(row).unwrap();
+                assert_eq!(line.lines_len(), 1);
+                assert!(line.projection.is_none());
+                assert_eq!(
+                    line.wrapped_lines.as_slice(),
+                    [0..text.slice_line(row).len()]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn projection_wraps_visible_text_and_maps_caret_to_source() {
+        let text = Rope::from("**abcd**\ntail");
+        let mut wrapper = TextWrapper::new(test_font(), px(14.), Some(px(10.)));
+        wrapper.replacements = vec![
+            DisplayReplacement {
+                range: 0..2,
+                text: "".into(),
+            },
+            DisplayReplacement {
+                range: 6..8,
+                text: "".into(),
+            },
+        ];
+        wrapper._update(&text, &(0..text.len()), &text, &mut |line, _| {
+            assert!(line == "abcd" || line == "tail");
+            vec![Boundary {
+                ix: 2,
+                next_indent: 0,
+            }]
+        });
+        assert_eq!(wrapper.len(), 4);
+        let point = wrapper.offset_to_display_point(5);
+        assert_eq!((point.row, point.column), (1, 1));
+        assert_eq!(wrapper.display_point_to_offset(point), 5);
+        assert_eq!(
+            wrapper.display_point_to_offset(WrapDisplayPoint::new(0, 0, 0)),
+            2
+        );
+    }
+
+    #[test]
+    fn rendered_blocks_reserve_rows_and_restore_source_lines() {
+        let text = Rope::from("before\n```\ncode\n```\nafter");
+        let mut wrapper = TextWrapper::new(test_font(), px(14.), None);
+        wrapper.blocks = vec![DisplayBlockLayout {
+            lines: 1..4,
+            rows: 6,
+        }];
+        wrapper._update(&text, &(0..text.len()), &text, &mut |_, _| vec![]);
+        assert_eq!(wrapper.lines_count(), 5);
+        assert_eq!(wrapper.len(), 8);
+        assert_eq!(wrapper.buffer_line_to_wrap_row_range(1), 1..7);
+        assert_eq!(wrapper.buffer_line_to_wrap_row_range(2), 7..7);
+        assert_eq!(wrapper.wrap_row_to_buffer_line(6), 1);
+        assert_eq!(wrapper.wrap_row_to_buffer_line(7), 4);
+        wrapper.blocks.clear();
+        wrapper._update(&text, &(0..text.len()), &text, &mut |_, _| vec![]);
+        assert_eq!(wrapper.len(), 5);
+        for row in 0..5 {
+            assert_eq!(wrapper.wrap_row_to_buffer_line(row), row);
+        }
+        assert_eq!(wrapper.text(), &text);
+    }
 
     #[test]
     fn test_update() {
@@ -1034,16 +1497,19 @@ mod tests {
         wrapper.lines = SumTree::from_iter(
             vec![
                 LineItem {
+                    projection: None,
                     len: 2,
                     indent: 0,
                     wrapped_lines: smallvec::smallvec![0..2],
                 },
                 LineItem {
+                    projection: None,
                     len: 4,
                     indent: 0,
                     wrapped_lines: smallvec::smallvec![0..2, 2..4],
                 },
                 LineItem {
+                    projection: None,
                     len: 1,
                     indent: 0,
                     wrapped_lines: smallvec::smallvec![0..1],
@@ -1172,24 +1638,28 @@ mod tests {
             vec![
                 // range: 0..15
                 LineItem {
+                    projection: None,
                     len: Rope::from("Hello, 世界!\r").len(),
                     indent: 0,
                     wrapped_lines: smallvec::smallvec![0..15],
                 },
                 // range: 16..36
                 LineItem {
+                    projection: None,
                     len: Rope::from("This is second line.\n").len(),
                     indent: 0,
                     wrapped_lines: smallvec::smallvec![0..10, 10..20],
                 },
                 // range: 37..56
                 LineItem {
+                    projection: None,
                     len: Rope::from("This is third line.\n").len(),
                     indent: 0,
                     wrapped_lines: smallvec::smallvec![0..9, 9..15, 15..20],
                 },
                 // range: 57..79
                 LineItem {
+                    projection: None,
                     len: Rope::from("这里是第 4 行。").len(),
                     indent: 0,
                     wrapped_lines: smallvec::smallvec![0..22],

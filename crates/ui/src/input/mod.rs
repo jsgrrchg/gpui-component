@@ -18,20 +18,23 @@ pub use gpui_base::input::{
     Backspace, BufferPoint, CodeActionItem, CodeActionProvider, CompletionMenuOptions,
     CompletionProvider, Copy, Cut, DefinitionProvider, Delete, DeleteToBeginningOfLine,
     DeleteToEndOfLine, DeleteToNextWordEnd, DeleteToPreviousWordStart, DisplayMap, DisplayPoint,
-    DocumentColorProvider, DocumentRangeSemanticTokensProvider, EditorState, Enter, Escape,
+    DisplayReplacement, DocumentColorProvider, DocumentRangeSemanticTokensProvider, EditorDisplay,
+    EditorDisplayBlock, EditorDisplayBlockCache, EditorDisplayProvider, EditorState, Enter, Escape,
     FoldRange, GoToDefinition, HighlightStyleResolver, HoverPopoverState, HoverProvider, Indent,
     IndentInline, InputEdit, InputEvent, InputHighlighter, InputHighlighterFactory, InputState,
     Lsp, MaskPattern, MoveDown, MoveEnd, MoveHome, MoveLeft, MovePageDown, MovePageUp, MoveRight,
     MoveToEnd, MoveToEndOfLine, MoveToNextWord, MoveToPreviousWord, MoveToStart, MoveToStartOfLine,
     MoveUp, Outdent, OutdentInline, Paste, Point, Redo, Replace, Rope, RopeExt, RopeLines, Search,
     SelectAll, SelectToEnd, SelectToEndOfLine, SelectToNextWordEnd, SelectToPreviousWordStart,
-    SelectToStart, SelectToStartOfLine, Selection, ShowCharacterPalette, ShowDocumentHandler,
-    TabSize, TextDecoration, TextDecorationCollection, TextareaState, ToggleCodeActions, Undo,
-    WrappingIndent,
+    SelectToStart, SelectToStartOfLine, Selection, SharedEditorDisplayProvider,
+    ShowCharacterPalette, ShowDocumentHandler, TabSize, TextDecoration, TextDecorationCollection,
+    TextareaState, ToggleCodeActions, Undo, WrappingIndent,
 };
 pub use gpui_base::input::{EditorMode, InputMode, InputModeKind, TextareaMode};
 #[doc(hidden)]
 mod editor;
+mod markdown;
+pub use markdown::MarkdownMode;
 mod state;
 mod textarea;
 pub use editor::Editor;

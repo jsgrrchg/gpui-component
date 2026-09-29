@@ -2,6 +2,8 @@ use gpui::{App, Div, Entity, InteractiveElement as _, IntoElement, RenderOnce, S
 
 use super::{EditorMode, InputBaseState, InputModeKind};
 
+mod markdown;
+
 /// State for source-code editing.
 ///
 /// This is the shared editing engine in its code-editor kind. Languages, line
@@ -15,6 +17,17 @@ impl InputModeKind for EditorMode {
     const CODE_EDITOR: bool = true;
 
     type Extras = super::EditorExtras;
+
+    fn newline_edit(state: &InputBaseState<Self>) -> Option<(std::ops::Range<usize>, String)> {
+        if state.ime_marked_range.is_some()
+            || !(state.extras.markdown_editing
+                || matches!(&state.mode, super::mode::LayoutMode::CodeEditor { language, .. }
+            if language.as_ref() == "markdown"))
+        {
+            return None;
+        }
+        markdown::newline_edit(state.text(), state.selected_range())
+    }
 
     fn hover_definition_style(
         state: &InputBaseState<Self>,
@@ -76,6 +89,13 @@ impl InputModeKind for EditorMode {
         window: &mut Window,
         cx: &mut gpui::Context<InputBaseState<Self>>,
     ) -> bool {
+        if event.modifiers.secondary()
+            && let Some(provider) = &state.extras.display_provider
+            && let Some(url) = provider.borrow().link_at(offset)
+        {
+            cx.open_url(&url);
+            return true;
+        }
         state.handle_click_hover_definition(event, offset, window, cx)
     }
 
@@ -169,6 +189,14 @@ impl InputModeKind for EditorMode {
 }
 
 impl EditorState {
+    /// Enable Markdown list, task, and quote editing independently of highlighting.
+    pub fn set_markdown_editing(&mut self, enabled: bool, cx: &mut gpui::Context<Self>) {
+        if self.extras.markdown_editing != enabled {
+            self.extras.markdown_editing = enabled;
+            cx.notify();
+        }
+    }
+
     /// The LSP providers and their cached results.
     ///
     /// This exists on the editor alone: an ordinary input or textarea has no
@@ -205,6 +233,9 @@ impl RenderOnce for Editor {
 
 /// What a code editor exposes to the renderer. See [`crate::input::InputExtras`].
 impl crate::input::InputExtras for super::EditorExtras {
+    fn display_provider(&self) -> Option<super::SharedEditorDisplayProvider> {
+        self.display_provider.clone()
+    }
     fn decoration_layers(&self) -> Vec<&[super::TextDecoration]> {
         self.decorations.iter().collect()
     }

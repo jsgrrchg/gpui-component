@@ -49,6 +49,52 @@ let editor = cx.new(|cx| {
 });
 ```
 
+## Markdown modes
+
+Use the same `EditorState` to switch between Markdown source and an editable
+live preview. A live preview hides syntax outside the active token, renders
+headings, code blocks, tables, images, quotes and task lists, and reveals a
+block's source when clicked or selected.
+
+```rust
+use gpui_component::input::{Editor, EditorState, MarkdownMode};
+
+let editor = cx.new(|cx| {
+    EditorState::new(window, cx)
+        .language("markdown")
+        .line_number(false)
+        .folding(false)
+        .default_value("# Notes\n\n**Hello**\n\n- [ ] Write a note")
+});
+
+Editor::new(&editor)
+    .markdown_mode(MarkdownMode::LivePreview)
+    .h(px(480.))
+```
+
+`MarkdownMode::Source` shows the editable source; `MarkdownMode::Preview`
+provides a selectable reading view. Put a second editor with `Preview` next
+to the editable one to make a live preview pane. Both read the same state.
+The pane refreshes automatically when the document changes.
+
+Formatting supports bold, italic, strikethrough, inline code, links and
+`==highlight==`. Ctrl-click (Cmd-click on macOS) opens inline links. Task
+checkboxes, including nested tasks and tasks inside quotes, update the original
+`[ ]` / `[x]` marker and participate in undo.
+Read-only mode disables task changes while keeping source selection available.
+
+Clicking the upper half of a rendered block reveals its source at the start;
+clicking the lower half places the cursor at the end.
+
+In both editable modes, Enter continues bullets, ordered lists, task lists and
+quote prefixes. New tasks start unchecked, and Enter on an empty item removes
+its marker. Enter on an empty quote removes one quote level. Shift+Enter inserts
+a newline without continuing a marker. Fenced code keeps normal editor behavior.
+
+Switching modes does not replace the source, cursor, selection or undo history.
+Parsing and preview rendering work without tree-sitter, including on WASM;
+the Markdown grammar feature only adds source syntax highlighting.
+
 ## Decorations
 
 ```rust

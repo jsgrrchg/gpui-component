@@ -36,6 +36,22 @@ DisplayMap                 Public facade (BufferPos ↔ DisplayPos)
 
 Built on `TextWrapper`. Provides buffer ↔ wrap coordinate mapping with prefix sum cache for O(1) line lookups.
 
+`EditorDisplayProvider` can project a line's text before wrapping. Each projected
+line keeps both source-to-display and display-to-source UTF-8 byte mappings.
+Text shaping, hit testing, Home/End and caret movement use those mappings;
+editing, search, clipboard and undo continue to use the original rope.
+
+Replacements are sorted and normalized once per snapshot. Each line binary-seeks
+its overlapping replacements, avoiding a scan of the full replacement list.
+Changing active tokens or block measurements rewraps only affected buffer rows;
+the `SumTree` retains the other lines. Character references and escapes replace
+only their own source spans, preserving positions in surrounding text.
+
+Rendered blocks reserve measured visual rows on their first buffer line and
+zero rows on their continuation lines. The provider reveals the original lines
+when the cursor or selection touches the block. Block measurements are cached
+by width and font, and visible blocks are measured again as their contents load.
+
 ### `FoldMap` — Fold projection layer
 
 Maintains `visible_wrap_rows` and reverse mapping. When no folds are active, uses identity mapping (wrap_row == display_row) without Vec allocation.

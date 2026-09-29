@@ -2,8 +2,8 @@ use crate::input::{InputExtras as _, InputModeKind};
 use gpui::Corners;
 use gpui::Half;
 use gpui::{
-    AnyElement, App, Bounds, ContentMask, Edges, Element, ElementId, ElementInputHandler, Entity,
-    GlobalElementId,
+    AnyElement, App, AvailableSpace, Bounds, ContentMask, Edges, Element, ElementId,
+    ElementInputHandler, Entity, GlobalElementId,
 };
 use gpui::{
     HighlightStyle, Hitbox, HitboxBehavior, Hsla, InteractiveElement, IntoElement, LayoutId,
@@ -405,6 +405,7 @@ struct FoldIconLayout {
 pub(super) struct TextElement<M: InputModeKind> {
     pub(crate) state: Entity<InputBaseState<M>>,
     placeholder: SharedString,
+    display: crate::input::EditorDisplay,
 }
 
 impl<M: InputModeKind> TextElement<M> {
@@ -412,6 +413,7 @@ impl<M: InputModeKind> TextElement<M> {
         Self {
             state,
             placeholder: SharedString::default(),
+            display: crate::input::EditorDisplay::default(),
         }
     }
 
@@ -1360,27 +1362,44 @@ impl<M: InputModeKind> TextElement<M> {
         let mut run_offset = 0;
 
         for (vi, &buffer_line) in last_layout.visible_buffer_lines.iter().enumerate() {
-            let line_text: String = display_text.slice_line(buffer_line).into();
+            let source: String = display_text.slice_line(buffer_line).into();
             let line_item = state
                 .display_map
                 .line(buffer_line)
                 .expect("line should exists in wrapper");
 
-            debug_assert_eq!(line_item.len(), line_text.len());
+            debug_assert_eq!(line_item.len(), source.len());
+            let line_text = line_item
+                .projection
+                .as_ref()
+                .map(|p| p.text.as_ref())
+                .unwrap_or(&source);
+            let source_runs = runs_for_range(runs, run_offset, &(0..source.len()));
+            let source_runs = split_runs_by_bg_segments(
+                last_layout.visible_line_byte_offsets[vi],
+                &source_runs,
+                bg_segments,
+            );
+            let projected_runs = if let Some(projection) = &line_item.projection {
+                let mut offset = 0;
+                source_runs
+                    .into_iter()
+                    .filter_map(|mut run| {
+                        let from = projection.source_to_display(offset);
+                        offset += run.len;
+                        let to = projection.source_to_display(offset);
+                        run.len = to.saturating_sub(from);
+                        (run.len > 0).then_some(run)
+                    })
+                    .collect::<Vec<_>>()
+            } else {
+                source_runs
+            };
 
             let mut wrapped_lines: SmallVec<[ShapedLine; 1]> = SmallVec::with_capacity(1);
 
             for range in &line_item.wrapped_lines {
-                let line_runs = runs_for_range(runs, run_offset, &range);
-                let line_runs = if bg_segments.is_empty() {
-                    line_runs
-                } else {
-                    split_runs_by_bg_segments(
-                        last_layout.visible_line_byte_offsets[vi] + (range.start),
-                        &line_runs,
-                        bg_segments,
-                    )
-                };
+                let line_runs = runs_for_range(&projected_runs, 0, &range);
 
                 let sub_line: SharedString = line_text[range.clone()].to_string().into();
                 let shaped_line = window
@@ -1404,12 +1423,13 @@ impl<M: InputModeKind> TextElement<M> {
 
             let line_layout = LineLayout::new()
                 .lines(wrapped_lines)
+                .projection(line_item.projection.clone(), source.len())
                 .wrap_indent(wrap_indent)
                 .with_whitespaces(whitespace_indicators.clone());
             lines.push(line_layout);
 
             // +1 for the `\n`
-            run_offset += line_text.len() + 1;
+            run_offset += source.len() + 1;
         }
 
         lines
@@ -1438,7 +1458,11 @@ impl<M: InputModeKind> TextElement<M> {
                     .then(|| {
                         compose_decoration_collections(
                             Vec::new(),
-                            state.extras.decoration_layers().into_iter(),
+                            state
+                                .extras
+                                .decoration_layers()
+                                .into_iter()
+                                .chain(std::iter::once(self.display.decorations.as_slice())),
                             visible_byte_range,
                         )
                     })
@@ -1450,7 +1474,11 @@ impl<M: InputModeKind> TextElement<M> {
                 .then(|| {
                     compose_decoration_collections(
                         Vec::new(),
-                        state.extras.decoration_layers().into_iter(),
+                        state
+                            .extras
+                            .decoration_layers()
+                            .into_iter()
+                            .chain(std::iter::once(self.display.decorations.as_slice())),
                         visible_byte_range,
                     )
                 })
@@ -1544,7 +1572,11 @@ impl<M: InputModeKind> TextElement<M> {
         if !state.masked {
             styles = compose_decoration_collections(
                 styles,
-                state.extras.decoration_layers().into_iter(),
+                state
+                    .extras
+                    .decoration_layers()
+                    .into_iter()
+                    .chain(std::iter::once(self.display.decorations.as_slice())),
                 visible_byte_range.clone(),
             )
             .unwrap_or_default();
@@ -1556,6 +1588,7 @@ impl<M: InputModeKind> TextElement<M> {
 }
 
 pub(super) struct PrepaintState {
+    display_blocks: Vec<AnyElement>,
     /// The lines of entire lines.
     last_layout: LastLayout,
     /// The lines only contains the visible lines in the viewport, based on `visible_range`.
@@ -1732,6 +1765,78 @@ impl<M: InputModeKind> Element for TextElement<M> {
         };
 
         let wrapping_indent = state.wrapping_indent;
+        let provider = state.extras.display_provider();
+        let selection = if let Some(marked) = &state.ime_marked_range {
+            marked.start..marked.end
+        } else {
+            state.selected_range()
+        };
+        self.display = provider
+            .map(|provider| {
+                provider.borrow_mut().display(
+                    &text,
+                    selection,
+                    state.focus_handle.is_focused(window),
+                    window,
+                    cx,
+                )
+            })
+            .unwrap_or_default();
+        let line_height = window.line_height();
+        let block_width = (bounds.size.width - line_number_width - RIGHT_MARGIN).max(px(1.));
+        let previous_visible = self
+            .state
+            .read(cx)
+            .last_layout
+            .as_ref()
+            .map(|layout| layout.visible_buffer_lines.clone())
+            .unwrap_or_default();
+        let block_key = (block_width, style.font(), text_size, line_height);
+        let mut block_elements = Vec::new();
+        let mut block_layouts = Vec::new();
+        for block in &self.display.blocks {
+            let first_line = text.offset_to_point(block.range.start).row;
+            let last_line = text.offset_to_point(block.range.end.saturating_sub(1)).row;
+            let cached = block.cache.borrow();
+            let reuse = cached.key.as_ref() == Some(&block_key)
+                && previous_visible.binary_search(&first_line).is_err();
+            let cached_size = cached.size;
+            drop(cached);
+            let mut element = None;
+            let measured = if reuse {
+                cached_size
+            } else {
+                let mut view = (block.render)(window, cx);
+                let measured = view.layout_as_root(
+                    size(
+                        AvailableSpace::Definite(block_width),
+                        AvailableSpace::MinContent,
+                    ),
+                    window,
+                    cx,
+                );
+                element = Some(view);
+                let mut cache = block.cache.borrow_mut();
+                cache.key = Some(block_key.clone());
+                cache.size = measured;
+                measured
+            };
+            let rows = (f32::from(measured.height) / f32::from(line_height))
+                .ceil()
+                .max(1.) as usize;
+            block_layouts.push(crate::input::display::DisplayBlockLayout {
+                lines: first_line..last_line + 1,
+                rows,
+            });
+            block_elements.push((
+                first_line,
+                element,
+                size(block_width, line_height * rows),
+                block.render.clone(),
+                block.cache.clone(),
+            ));
+        }
+        let state = self.state.read(cx);
         let wrap_width_changed = state
             .last_layout
             .as_ref()
@@ -1744,12 +1849,48 @@ impl<M: InputModeKind> Element for TextElement<M> {
             .map(|l| l.wrapping_indent != wrapping_indent)
             .unwrap_or(true);
 
-        if wrap_width_changed || wrapping_indent_changed {
-            self.state.update(cx, |state, cx| {
+        self.state.update(cx, |state, cx| {
+            let anchor = state.last_layout.as_ref().and_then(|_| {
+                let count = state.display_map.display_row_count();
+                if count == 0 {
+                    return None;
+                }
+                let scroll = state.scroll_handle.offset();
+                let top = (f32::from(-scroll.y) / f32::from(line_height))
+                    .floor()
+                    .max(0.) as usize;
+                let mut line = state
+                    .display_map
+                    .display_row_to_buffer_line(top.min(count - 1));
+                if let Some(block) = block_layouts
+                    .iter()
+                    .find(|block| block.lines.contains(&line))
+                {
+                    line = block.lines.start;
+                }
+                let screen_y =
+                    scroll.y + line_height * state.display_map.buffer_line_to_display_row(line);
+                Some((line, screen_y, scroll.x))
+            });
+            let changed = state.display_map.set_projection(
+                self.display.replacements.clone(),
+                block_layouts,
+                cx,
+            );
+            if wrap_width_changed || wrapping_indent_changed {
                 state.display_map.on_layout_changed(wrap_width, cx);
                 state.display_map.set_wrapping_indent(wrapping_indent, cx);
-            });
-        }
+            }
+            if changed
+                && state.deferred_scroll_offset.is_none()
+                && let Some((line, screen_y, x)) = anchor
+            {
+                let y = (screen_y
+                    - line_height * state.display_map.buffer_line_to_display_row(line))
+                .min(px(0.));
+                state.scroll_handle.set_offset(point(x, y));
+            }
+        });
 
         let state = self.state.read(cx);
         let line_height = window.line_height();
@@ -1887,7 +2028,17 @@ impl<M: InputModeKind> Element for TextElement<M> {
         // 2. Multi-line with soft wrap disabled.
         if state.is_single_line() || !state.soft_wrap {
             let longest_row = state.display_map.longest_row();
-            let longest_line: SharedString = state.text.slice_line(longest_row).to_string().into();
+            let item = state.display_map.line(longest_row);
+            let longest_line: SharedString =
+                if let Some(projection) = item.and_then(|line| line.projection.as_ref()) {
+                    projection.text.clone()
+                } else if item.is_some_and(|line| {
+                    line.wrapped_lines.last().is_none_or(|range| range.end == 0)
+                }) {
+                    "".into()
+                } else {
+                    state.text.slice_line(longest_row).to_string().into()
+                };
             longest_line_width = window
                 .text_system()
                 .shape_line(
@@ -2067,7 +2218,56 @@ impl<M: InputModeKind> Element for TextElement<M> {
         let fold_icon_layout =
             self.layout_fold_icons(original_x, &bounds, &last_layout, window, cx);
 
+        let mut display_blocks = Vec::new();
+        for (line, element, block_size, render, cache) in block_elements {
+            if last_layout
+                .visible_buffer_lines
+                .binary_search(&line)
+                .is_ok()
+            {
+                let mut element = if let Some(element) = element {
+                    element
+                } else {
+                    let mut element = render(window, cx);
+                    let measured = element.layout_as_root(
+                        size(
+                            AvailableSpace::Definite(block_width),
+                            AvailableSpace::MinContent,
+                        ),
+                        window,
+                        cx,
+                    );
+                    if measured != cache.borrow().size {
+                        cache.borrow_mut().size = measured;
+                        self.state.update(cx, |_, cx| cx.notify());
+                    }
+                    element
+                };
+                let y = line_height
+                    * self
+                        .state
+                        .read(cx)
+                        .display_map
+                        .buffer_line_to_display_row(line);
+                window.with_content_mask(
+                    Some(ContentMask {
+                        bounds: content_bounds,
+                    }),
+                    |window| {
+                        element.prepaint_as_root(
+                            bounds.origin + point(line_number_width, y),
+                            block_size.into(),
+                            window,
+                            cx,
+                        );
+                    },
+                );
+                display_blocks.push(element);
+            }
+        }
+
         PrepaintState {
+            display_blocks,
             bounds,
             last_layout,
             scroll_size,
@@ -2142,6 +2342,9 @@ impl<M: InputModeKind> Element for TextElement<M> {
         });
         let mut cursor_row_y = None;
         window.with_content_mask(content_mask, |window| {
+            for block in &mut prepaint.display_blocks {
+                block.paint(window, cx);
+            }
             // Paint active line
             let mut offset_y = px(0.);
             if let Some(line_numbers) = prepaint.line_numbers.as_ref() {

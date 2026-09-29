@@ -21,6 +21,8 @@ mod cursor;
 mod decorations;
 #[path = "editor/diagnostics.rs"]
 mod diagnostics;
+#[path = "editor/display.rs"]
+mod display;
 #[path = "editor/display_map/mod.rs"]
 mod display_map;
 mod editor;
@@ -68,6 +70,10 @@ pub use decorations::{TextDecoration, TextDecorationCollection};
 pub use diagnostics::{
     Diagnostic, DiagnosticEntry, DiagnosticRelatedInformation, DiagnosticSet, DiagnosticSeverity,
     DiagnosticSummary, DiagnosticTag, RelatedInformation,
+};
+pub use display::{
+    DisplayReplacement, EditorDisplay, EditorDisplayBlock, EditorDisplayBlockCache,
+    EditorDisplayProvider, SharedEditorDisplayProvider,
 };
 pub use display_map::{BufferPoint, DisplayMap, DisplayPoint, FoldRange, WrappingIndent};
 pub use editor::{Editor, EditorState};

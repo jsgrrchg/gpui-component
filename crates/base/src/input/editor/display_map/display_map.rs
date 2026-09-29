@@ -32,6 +32,19 @@ pub struct DisplayMap {
 }
 
 impl DisplayMap {
+    pub(crate) fn set_projection(
+        &mut self,
+        replacements: Vec<crate::input::DisplayReplacement>,
+        blocks: Vec<crate::input::display::DisplayBlockLayout>,
+        cx: &mut App,
+    ) -> bool {
+        if self.wrap_map.set_projection(replacements, blocks, cx) {
+            self.rebuild_fold_projection();
+            true
+        } else {
+            false
+        }
+    }
     pub fn new(font: Font, font_size: Pixels, wrap_width: Option<Pixels>) -> Self {
         Self {
             wrap_map: WrapMap::new(font, font_size, wrap_width),

@@ -76,6 +76,24 @@ opening behavior. If no handler is installed, links continue to use
 `App::open_url` as usual. The callback is used for both text links and linked
 images.
 
+## Task Checkbox Handling
+
+Use `on_task_toggle` to make Markdown task checkboxes interactive, including
+nested tasks and tasks inside quotes:
+
+```rust
+markdown(source)
+    .on_task_toggle(|item_offset, checked, window, cx| {
+        // Apply the change to the document that owns this preview.
+    })
+    .task_list_readonly(false)
+```
+
+The callback receives the task list item's UTF-8 byte offset in the supplied
+source and its new checked state. The owner updates the corresponding `[ ]` /
+`[x]` marker and renders the changed source. `task_list_readonly(true)` disables
+the controls. Without a callback, task checkboxes remain a static representation.
+
 ## Markdown Plugins
 
 Use `.plugin(...)` to support custom Markdown formats. A plugin owns both parsing and rendering, so callers only need to attach it to the `TextView`:

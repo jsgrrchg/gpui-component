@@ -1,11 +1,11 @@
 use std::rc::Rc;
 
 use gpui::{
-    App, DefiniteLength, Entity, IntoElement, RenderOnce, SharedString, StyleRefinement, Styled,
-    Window, prelude::FluentBuilder as _,
+    App, DefiniteLength, Entity, IntoElement, ParentElement, RenderOnce, SharedString,
+    StyleRefinement, Styled, Window, prelude::FluentBuilder as _,
 };
 
-use super::{EditorState, Input};
+use super::{EditorState, Input, MarkdownMode};
 use crate::native_menu::NativeMenu;
 use crate::{RoleOverride, StyledExt as _};
 
@@ -19,6 +19,7 @@ pub struct Editor {
     bordered: bool,
     disabled: bool,
     readonly: bool,
+    markdown_mode: Option<MarkdownMode>,
     tab_index: isize,
     role: RoleOverride,
     aria_label: Option<SharedString>,
@@ -39,6 +40,7 @@ impl Editor {
             bordered: true,
             disabled: false,
             readonly: false,
+            markdown_mode: None,
             tab_index: 0,
             role: RoleOverride::default(),
             aria_label: None,
@@ -81,6 +83,13 @@ impl Editor {
         self
     }
 
+    /// Show Markdown source, a reading preview, or a NeverWrite-style editable preview.
+    /// Set the state's language to `markdown` for source highlighting.
+    pub fn markdown_mode(mut self, mode: MarkdownMode) -> Self {
+        self.markdown_mode = Some(mode);
+        self
+    }
+
     pub fn role(mut self, role: impl Into<RoleOverride>) -> Self {
         self.role = role.into();
         self
@@ -111,7 +120,23 @@ impl Styled for Editor {
 }
 
 impl RenderOnce for Editor {
-    fn render(self, _: &mut Window, _: &mut App) -> impl IntoElement {
+    fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
+        if let Some(mode) = self.markdown_mode {
+            if mode == MarkdownMode::Preview {
+                return gpui::div()
+                    .size_full()
+                    .child(super::markdown::reading_preview(&self.state, window, cx))
+                    .when_some(self.height, |this, height| this.h(height))
+                    .refine_style(&self.style)
+                    .into_any_element();
+            }
+            let provider = (mode == MarkdownMode::LivePreview)
+                .then(|| super::markdown::provider(&self.state, window, cx));
+            self.state.update(cx, |state, cx| {
+                state.set_markdown_editing(true, cx);
+                state.set_display_provider(provider, cx);
+            });
+        }
         Input::from_state(self.state.clone())
             .appearance(self.appearance)
             .bordered(self.bordered)
@@ -126,5 +151,6 @@ impl RenderOnce for Editor {
                 this.context_menu(move |menu, window, cx| build(menu, window, cx))
             })
             .refine_style(&self.style)
+            .into_any_element()
     }
 }

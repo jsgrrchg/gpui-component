@@ -6,10 +6,14 @@ use gpui::{
 use gpui_component::{ActiveTheme, h_flex, input::*, switch::Switch, tab::TabBar, v_flex};
 
 const EXAMPLE_CODE: &str = include_str!("./editor_preview.rs");
+const EXAMPLE_MARKDOWN: &str = include_str!("./editor_markdown.md");
 
 pub struct EditorStory {
     editor_state: Entity<EditorState>,
     decorations_state: Entity<EditorState>,
+    markdown_state: Entity<EditorState>,
+    markdown_mode: MarkdownMode,
+    preview_pane: bool,
     _decorations: TextDecorationCollection,
     active_tab: usize,
     readonly: bool,
@@ -20,7 +24,7 @@ impl super::Story for EditorStory {
     }
 
     fn description() -> &'static str {
-        "Code editor with theme-aware syntax highlighting and folding."
+        "Code editor and Markdown with source, live preview, and a preview pane."
     }
 
     fn closable() -> bool {
@@ -66,6 +70,13 @@ impl EditorStory {
         }
 
         let decoration_text = "Decoration styles\nColor highlights important text.\nItalic adds emphasis.\nUnderline marks a review range.";
+        let markdown_state = cx.new(|cx| {
+            EditorState::new(window, cx)
+                .language("markdown")
+                .line_number(false)
+                .folding(false)
+                .default_value(EXAMPLE_MARKDOWN)
+        });
         let decorations_state = cx.new(|cx| {
             EditorState::new(window, cx)
                 .language("text")
@@ -128,8 +139,11 @@ impl EditorStory {
         Self {
             editor_state,
             decorations_state,
+            markdown_state,
+            markdown_mode: MarkdownMode::LivePreview,
+            preview_pane: false,
             _decorations: decorations,
-            active_tab: 0,
+            active_tab: 2,
             readonly: false,
         }
     }
@@ -153,7 +167,8 @@ impl Render for EditorStory {
                                 cx.notify();
                             }))
                             .child("Code")
-                            .child("Decorations"),
+                            .child("Decorations")
+                            .child("Markdown"),
                     )
                     .child(
                         Switch::new("editor-read-only")
@@ -165,6 +180,37 @@ impl Render for EditorStory {
                             })),
                     ),
             )
+            .children((self.active_tab == 2).then(|| {
+                h_flex()
+                    .justify_between()
+                    .child(
+                        TabBar::new("markdown-editor-modes")
+                            .underline()
+                            .w_64()
+                            .selected_index(usize::from(
+                                self.markdown_mode == MarkdownMode::LivePreview,
+                            ))
+                            .on_click(cx.listener(|this, selected: &usize, _, cx| {
+                                this.markdown_mode = if *selected == 0 {
+                                    MarkdownMode::Source
+                                } else {
+                                    MarkdownMode::LivePreview
+                                };
+                                cx.notify();
+                            }))
+                            .child("Source")
+                            .child("Live preview"),
+                    )
+                    .child(
+                        Switch::new("markdown-preview-pane")
+                            .label("Preview pane")
+                            .checked(self.preview_pane)
+                            .on_click(cx.listener(|this, checked: &bool, _, cx| {
+                                this.preview_pane = *checked;
+                                cx.notify();
+                            })),
+                    )
+            }))
             .child(div().min_h_0().flex_1().child(if self.active_tab == 0 {
                 Editor::new(&self.editor_state)
                     .font_family(cx.theme().mono_font_family.clone())
@@ -172,12 +218,32 @@ impl Render for EditorStory {
                     .readonly(self.readonly)
                     .size_full()
                     .into_any_element()
-            } else {
+            } else if self.active_tab == 1 {
                 Editor::new(&self.decorations_state)
                     .font_family(cx.theme().mono_font_family.clone())
                     .text_size(cx.theme().mono_font_size)
                     .readonly(self.readonly)
                     .size_full()
+                    .into_any_element()
+            } else {
+                h_flex()
+                    .size_full()
+                    .gap_3()
+                    .child(
+                        div().flex_1().min_w_0().h_full().child(
+                            Editor::new(&self.markdown_state)
+                                .markdown_mode(self.markdown_mode)
+                                .readonly(self.readonly)
+                                .size_full(),
+                        ),
+                    )
+                    .children(self.preview_pane.then(|| {
+                        div().flex_1().min_w_0().h_full().child(
+                            Editor::new(&self.markdown_state)
+                                .markdown_mode(MarkdownMode::Preview)
+                                .size_full(),
+                        )
+                    }))
                     .into_any_element()
             }))
     }
