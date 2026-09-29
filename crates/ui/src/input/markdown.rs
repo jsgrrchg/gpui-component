@@ -23,6 +23,7 @@ use crate::{
 };
 
 mod code_block;
+mod code_editor;
 
 /// Presentation of a Markdown document. All modes share the same editor state.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -107,6 +108,7 @@ struct Block {
     source_start: usize,
     source: SharedString,
     tasks: Vec<Task>,
+    code: Option<code_editor::FencedCode>,
     cache: Rc<RefCell<EditorDisplayBlockCache>>,
 }
 
@@ -213,6 +215,7 @@ struct MarkdownDocument {
     blocks: Vec<Block>,
     links: Vec<(Range<usize>, SharedString)>,
     definitions: String,
+    fenced_code_blocks: usize,
 }
 
 fn node_range(node: &Node) -> Option<Range<usize>> {
@@ -322,11 +325,24 @@ impl MarkdownDocument {
                     )],
                 });
             }
+            let code = if let Node::Code(code) = node {
+                self.fenced_code_blocks += 1;
+                code_editor::fenced_code(
+                    source,
+                    &range,
+                    code.lang.as_deref(),
+                    &code.value,
+                    self.fenced_code_blocks - 1,
+                )
+            } else {
+                None
+            };
             self.blocks.push(Block {
                 range: line_range(source, &range),
                 source_start: range.start,
                 source: format!("{}{}", &source[range], self.definitions).into(),
                 tasks,
+                code,
                 cache: Rc::default(),
             });
             return;
@@ -485,6 +501,7 @@ struct MarkdownDisplay {
     state: WeakEntity<EditorState>,
     text: super::Rope,
     document: MarkdownDocument,
+    code_focus: Rc<RefCell<code_editor::CodeFocus>>,
 }
 
 pub(super) fn provider(
@@ -499,6 +516,7 @@ pub(super) fn provider(
                 state: weak,
                 text: super::Rope::new(),
                 document: MarkdownDocument::default(),
+                code_focus: Rc::default(),
             })) as SharedEditorDisplayProvider
         });
     provider.read(cx).clone()
@@ -584,6 +602,29 @@ impl EditorDisplayProvider for MarkdownDisplay {
                 .push(super::TextDecoration::new(markup.range.clone(), style));
         }
         for block in &self.document.blocks {
+            if let Some(code) = &block.code {
+                let inside = touches(&selection, &block.range);
+                if self
+                    .code_focus
+                    .borrow_mut()
+                    .shows_source(code, &selection, inside, focused)
+                {
+                    continue;
+                }
+                let editable = Rc::new(code_editor::EditableCode {
+                    document: self.state.clone(),
+                    document_id: self.state.entity_id(),
+                    code: code.clone(),
+                    lines: block.range.clone(),
+                    focus: self.code_focus.clone(),
+                });
+                display.blocks.push(EditorDisplayBlock {
+                    range: block.range.clone(),
+                    cache: block.cache.clone(),
+                    render: Rc::new(move |window, cx| editable.render(window, cx)),
+                });
+                continue;
+            }
             if (focused || !selection.is_empty()) && touches(&selection, &block.range) {
                 continue;
             }
@@ -687,7 +728,7 @@ mod tests {
     use super::*;
     use gpui::{AppContext, Context, Render, TestAppContext, VisualTestContext, point};
 
-    struct MarkdownEditorTest {
+    pub(super) struct MarkdownEditorTest {
         state: Entity<EditorState>,
         mode: MarkdownMode,
         readonly: bool,
@@ -708,7 +749,7 @@ mod tests {
         }
     }
 
-    fn editor<'a>(
+    pub(super) fn editor<'a>(
         cx: &'a mut TestAppContext,
         source: &str,
     ) -> (
@@ -1046,6 +1087,93 @@ mod tests {
                 .read_with(cx, |state, _| state.value())
                 .contains("edit ")
         );
+    }
+
+    const CODE_SOURCE: &str = "intro\n\n```rust\nlet x = 1;\n```\n\nend";
+    const CODE_START: usize = 7;
+
+    pub(super) fn redraw(cx: &mut VisualTestContext) {
+        cx.run_until_parked();
+        cx.update(|window, cx| window.draw(cx).clear());
+        cx.run_until_parked();
+    }
+
+    #[gpui::test]
+    fn code_blocks_are_edited_in_place(cx: &mut TestAppContext) {
+        cx.update(crate::init);
+        let (_, state, cx) = editor(cx, CODE_SOURCE);
+        let body = cx
+            .debug_bounds("markdown-code-editor-7")
+            .expect("fenced code must render an editor");
+        cx.simulate_click(body.center(), gpui::Modifiers::default());
+        redraw(cx);
+        cx.simulate_input("Z");
+        redraw(cx);
+        let value = state.read_with(cx, |state, _| state.value());
+        assert!(value.starts_with("intro\n\n```rust\n"), "{value:?}");
+        assert!(value.ends_with("\n```\n\nend"), "{value:?}");
+        assert_eq!(value.len(), CODE_SOURCE.len() + 1);
+        assert!(cx.debug_bounds("markdown-live-block-7").is_some());
+        assert!(cx.debug_bounds("markdown-code-editor-7").is_some());
+    }
+
+    #[gpui::test]
+    fn caret_moves_through_code_blocks_and_escape_reveals_fences(cx: &mut TestAppContext) {
+        cx.update(crate::init);
+        let (_, state, cx) = editor(cx, CODE_SOURCE);
+        cx.update(|window, cx| {
+            state.update(cx, |state, cx| {
+                state.set_selected_range(CODE_START..CODE_START, cx);
+                state.focus(window, cx);
+            })
+        });
+        redraw(cx);
+        cx.simulate_input("Z");
+        redraw(cx);
+        assert_eq!(
+            state.read_with(cx, |state, _| state.value()).as_ref(),
+            "intro\n\n```rust\nZlet x = 1;\n```\n\nend"
+        );
+        assert!(cx.debug_bounds("markdown-live-block-7").is_some());
+
+        // Leaving the first code line returns to the document above the block.
+        cx.dispatch_action(super::super::MoveUp);
+        redraw(cx);
+        assert_eq!(
+            state.read_with(cx, |state, _| state.selected_range()),
+            CODE_START - 1..CODE_START - 1
+        );
+        assert!(cx.debug_bounds("markdown-live-block-7").is_some());
+
+        // Moving down re-enters the code; Escape reveals the fences as source.
+        cx.dispatch_action(super::super::MoveDown);
+        redraw(cx);
+        cx.dispatch_action(super::super::Escape);
+        redraw(cx);
+        assert!(cx.debug_bounds("markdown-live-block-7").is_none());
+        let caret = state.read_with(cx, |state, _| state.selected_range());
+        assert!(caret.start > CODE_START + "```rust".len(), "{caret:?}");
+
+        // Undo in the document resynchronizes the nested editor.
+        cx.dispatch_action(super::super::Undo);
+        cx.update(|window, cx| {
+            state.update(cx, |state, cx| {
+                state.set_selected_range(0..0, cx);
+                state.focus(window, cx);
+            })
+        });
+        redraw(cx);
+        assert_eq!(
+            state.read_with(cx, |state, _| state.value()).as_ref(),
+            CODE_SOURCE
+        );
+        let body = cx.debug_bounds("markdown-code-editor-7").unwrap();
+        cx.simulate_click(body.center(), gpui::Modifiers::default());
+        redraw(cx);
+        cx.simulate_input("Y");
+        redraw(cx);
+        let value = state.read_with(cx, |state, _| state.value());
+        assert!(!value.contains('Z') && value.contains('Y'), "{value:?}");
     }
 
     #[gpui::test]

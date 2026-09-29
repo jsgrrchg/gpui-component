@@ -5,8 +5,8 @@
 use std::sync::LazyLock;
 
 use gpui::{
-    App, InteractiveElement as _, IntoElement, MouseButton, ParentElement as _, ScrollHandle,
-    SharedString, StyleRefinement, Styled as _, StyledText, Window, div,
+    App, Div, InteractiveElement as _, IntoElement, MouseButton, ParentElement as _, Pixels,
+    ScrollHandle, SharedString, Stateful, StyleRefinement, Styled as _, StyledText, Window, div,
     prelude::FluentBuilder as _, px, relative,
 };
 use markdown::mdast::Node;
@@ -94,53 +94,11 @@ impl MarkdownPlugin for CodeBlockPlugin {
         let styles = data.block.styles(&theme.highlight_theme);
         let code_size = theme.mono_font_size;
 
-        div()
-            .id(id.clone())
-            .debug_selector(move || format!("{NAME}-{key}"))
-            .w_full()
-            .min_w_0()
-            .flex()
-            .flex_col()
-            .overflow_hidden()
-            .rounded(px(10.))
-            .border_1()
-            .border_color(theme.border)
-            .bg(theme.foreground.opacity(0.035))
-            .child(
-                div()
-                    .h(px(HEADER_HEIGHT))
-                    .flex_none()
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .pl(px(PADDING_X))
-                    .pr(px(5.))
-                    .border_b_1()
-                    .border_color(theme.border)
-                    .bg(theme.foreground.opacity(0.02))
-                    .child(
-                        div()
-                            .min_w_0()
-                            .truncate()
-                            .text_size(px(11.))
-                            .text_color(theme.muted_foreground)
-                            .children(data.lang.clone()),
-                    )
-                    .child(
-                        // Live preview reveals a block's source on mouse down;
-                        // copying must leave the rendered block in place.
-                        div()
-                            .flex_none()
-                            .debug_selector(move || format!("{NAME}-{key}-copy"))
-                            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                            .child(
-                                Clipboard::new(SharedString::from(format!("{id}-copy")))
-                                    .value(data.code.clone())
-                                    .tooltip("Copy"),
-                            ),
-                    ),
-            )
-            .child(horizontal_scroll_area(
+        frame(
+            key,
+            data.lang.clone(),
+            data.code.clone(),
+            horizontal_scroll_area(
                 SharedString::from(format!("{id}-body")),
                 &scroll_handle,
                 &StyleRefinement::default(),
@@ -158,9 +116,77 @@ impl MarkdownPlugin for CodeBlockPlugin {
                         this.min_h(code_size * LINE_HEIGHT_RATIO)
                     })
                     .child(StyledText::new(data.code.clone()).with_highlights(styles)),
-            ))
-            .into_any_element()
+            ),
+            cx,
+        )
+        .into_any_element()
     }
+}
+
+/// The line height Zeron uses for code at the theme's code size, rounded to
+/// whole pixels as the text system rounds an editor's line height.
+pub(super) fn line_height(cx: &App) -> Pixels {
+    (cx.theme().mono_font_size * LINE_HEIGHT_RATIO).round()
+}
+
+/// Zeron's code block frame: a header with the language and a copy action
+/// above `body`. `key` identifies the block within its document.
+pub(super) fn frame(
+    key: usize,
+    lang: Option<SharedString>,
+    code: SharedString,
+    body: impl IntoElement,
+    cx: &App,
+) -> Stateful<Div> {
+    let theme = cx.theme();
+    let id = SharedString::from(format!("{NAME}-{key}"));
+    div()
+        .id(id.clone())
+        .debug_selector(move || format!("{NAME}-{key}"))
+        .w_full()
+        .min_w_0()
+        .flex()
+        .flex_col()
+        .overflow_hidden()
+        .rounded(px(10.))
+        .border_1()
+        .border_color(theme.border)
+        .bg(theme.foreground.opacity(0.035))
+        .child(
+            div()
+                .h(px(HEADER_HEIGHT))
+                .flex_none()
+                .flex()
+                .items_center()
+                .justify_between()
+                .pl(px(PADDING_X))
+                .pr(px(5.))
+                .border_b_1()
+                .border_color(theme.border)
+                .bg(theme.foreground.opacity(0.02))
+                .child(
+                    div()
+                        .min_w_0()
+                        .truncate()
+                        .text_size(px(11.))
+                        .text_color(theme.muted_foreground)
+                        .children(lang),
+                )
+                .child(
+                    // Live preview reveals a block's source on mouse down;
+                    // copying must leave the rendered block in place.
+                    div()
+                        .flex_none()
+                        .debug_selector(move || format!("{NAME}-{key}-copy"))
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .child(
+                            Clipboard::new(SharedString::from(format!("{id}-copy")))
+                                .value(code)
+                                .tooltip("Copy"),
+                        ),
+                ),
+        )
+        .child(body)
 }
 
 #[cfg(test)]

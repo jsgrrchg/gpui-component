@@ -1,0 +1,562 @@
+//! Editable fenced code blocks for the Markdown live preview.
+//!
+//! A fenced block keeps its rendered frame while its code is edited in a
+//! nested code editor. The nested editor mirrors the code lines between the
+//! fences: its edits replace those lines in the document, and document
+//! changes (undo, external edits) replace its text. The fences themselves are
+//! revealed as source with Escape, a click on the header, or by leaving the
+//! code past the start or end of the document.
+
+use std::{cell::RefCell, ops::Range, rc::Rc};
+
+use gpui::{
+    AnyElement, App, AppContext as _, Bounds, Context, Entity, EntityId, EntityInputHandler as _,
+    InteractiveElement as _, IntoElement, MouseButton, ParentElement as _, Pixels,
+    ScrollWheelEvent, SharedString, Styled as _, Subscription, WeakEntity, Window, canvas, div,
+    point, px,
+};
+
+use super::code_block;
+use crate::{
+    ActiveTheme as _,
+    input::{Editor, EditorState, Escape, InputEvent, MoveDown, MoveLeft, MoveRight, MoveUp},
+};
+
+/// Vertical editor padding of a medium `Input`, which hosts the nested editor.
+const EDITOR_PADDING_Y: f32 = 8.;
+
+/// A fenced code block whose code lines can be edited in place.
+#[derive(Clone)]
+pub(super) struct FencedCode {
+    /// Position among the document's fenced code blocks; keys the nested editor.
+    pub(super) ordinal: usize,
+    pub(super) lang: Option<SharedString>,
+    pub(super) code: SharedString,
+    /// The code lines between the fences, including the final newline.
+    pub(super) content: Range<usize>,
+}
+
+/// Parse the code lines of a closed fence whose source matches `value`.
+///
+/// Fences inside containers or with normalized content are left to source
+/// editing, because their lines do not map one-to-one onto the code.
+pub(super) fn fenced_code(
+    source: &str,
+    range: &Range<usize>,
+    lang: Option<&str>,
+    value: &str,
+    ordinal: usize,
+) -> Option<FencedCode> {
+    let raw = &source[range.clone()];
+    let fence = raw.trim_start_matches(' ');
+    let marker = *fence.as_bytes().first()?;
+    let count = fence.bytes().take_while(|byte| *byte == marker).count();
+    if raw.len() - fence.len() > 3 || !matches!(marker, b'`' | b'~') || count < 3 {
+        return None;
+    }
+    let open_end = raw.find('\n')?;
+    let close_start = raw.rfind('\n')? + 1;
+    let closing = raw[close_start..].trim_matches(' ');
+    if closing.len() < count || !closing.bytes().all(|byte| byte == marker) {
+        return None;
+    }
+    let content = range.start + open_end + 1..range.start + close_start;
+    let lines = &source[content.clone()];
+    (lines.strip_suffix('\n').unwrap_or(lines) == value).then(|| FencedCode {
+        ordinal,
+        lang: lang.filter(|lang| !lang.is_empty()).map(SharedString::from),
+        code: value.to_string().into(),
+        content,
+    })
+}
+
+/// The document lines holding `code`.
+fn lines(code: &str) -> String {
+    if code.is_empty() {
+        String::new()
+    } else {
+        format!("{code}\n")
+    }
+}
+
+/// Which fenced block shows its source, and which should take focus.
+#[derive(Default)]
+pub(super) struct CodeFocus {
+    revealed: Option<usize>,
+    pending: Option<(usize, usize)>,
+}
+
+impl CodeFocus {
+    /// Whether a fenced block shows its Markdown source for the document
+    /// `selection`. A focused caret entering the block moves into its nested
+    /// editor instead, unless the source was revealed explicitly.
+    pub(super) fn shows_source(
+        &mut self,
+        code: &FencedCode,
+        selection: &Range<usize>,
+        inside: bool,
+        focused: bool,
+    ) -> bool {
+        if !inside {
+            if self.revealed == Some(code.ordinal) {
+                self.revealed = None;
+            }
+            return false;
+        }
+        if !focused {
+            return false;
+        }
+        if !selection.is_empty() || self.revealed == Some(code.ordinal) {
+            return true;
+        }
+        let offset = selection
+            .start
+            .saturating_sub(code.content.start)
+            .min(code.code.len());
+        self.pending = Some((code.ordinal, offset));
+        false
+    }
+}
+
+struct CodeEditor {
+    editor: Entity<EditorState>,
+    document: WeakEntity<EditorState>,
+    lang: Option<SharedString>,
+    /// The document offset of the code lines and the code they held.
+    synced: Option<(usize, SharedString)>,
+    _subscription: Subscription,
+}
+
+impl CodeEditor {
+    fn new(
+        document: WeakEntity<EditorState>,
+        lang: Option<SharedString>,
+        code: SharedString,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let editor = cx.new(|cx| {
+            EditorState::new(window, cx)
+                .language(lang.clone().unwrap_or_else(|| "text".into()))
+                .line_number(false)
+                .folding(false)
+                .soft_wrap(false)
+                .scroll_beyond_last_line(Some(0))
+                .default_value(code)
+        });
+        let subscription = cx.subscribe_in(&editor, window, Self::on_editor_event);
+        Self {
+            editor,
+            document,
+            lang,
+            synced: None,
+            _subscription: subscription,
+        }
+    }
+
+    /// Mirror the document's code into the nested editor.
+    fn sync(&mut self, code: &FencedCode, window: &mut Window, cx: &mut Context<Self>) {
+        self.synced = Some((code.content.start, code.code.clone()));
+        if self.lang != code.lang {
+            self.lang = code.lang.clone();
+            let lang = self.lang.clone().unwrap_or_else(|| "text".into());
+            self.editor
+                .update(cx, |editor, cx| editor.set_highlighter(lang, cx));
+        }
+        self.editor.update(cx, |editor, cx| {
+            if editor.value() == code.code {
+                return;
+            }
+            let selection = editor.selected_range();
+            editor.set_value(code.code.clone(), window, cx);
+            let mut offset = selection.start.min(code.code.len());
+            while !code.code.is_char_boundary(offset) {
+                offset -= 1;
+            }
+            editor.set_selected_range(offset..offset, cx);
+        });
+    }
+
+    fn on_editor_event(
+        &mut self,
+        editor: &Entity<EditorState>,
+        event: &InputEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !matches!(event, InputEvent::Change) {
+            return;
+        }
+        let Some((start, previous)) = self.synced.clone() else {
+            return;
+        };
+        let (code, selection) =
+            editor.read_with(cx, |editor, _| (editor.value(), editor.selected_range()));
+        let Some(document) = self.document.upgrade() else {
+            return;
+        };
+        if code == previous {
+            return;
+        }
+        let replaced = document.update(cx, |document, cx| {
+            let previous = lines(&previous);
+            let end = start + previous.len();
+            if document.value().get(start..end) != Some(previous.as_str()) {
+                // The document changed underneath; the next render resyncs.
+                return false;
+            }
+            let range =
+                document.text().byte_to_utf16_idx(start)..document.text().byte_to_utf16_idx(end);
+            document.replace_text_in_range(Some(range), &lines(&code), window, cx);
+            document.set_selected_range(start + selection.start..start + selection.end, cx);
+            true
+        });
+        if replaced {
+            self.synced = Some((start, code));
+        }
+    }
+}
+
+/// Everything a live block needs to render an editable fenced code block.
+pub(super) struct EditableCode {
+    pub(super) document: WeakEntity<EditorState>,
+    pub(super) document_id: EntityId,
+    pub(super) code: FencedCode,
+    /// The block's complete source lines, fences included.
+    pub(super) lines: Range<usize>,
+    pub(super) focus: Rc<RefCell<CodeFocus>>,
+}
+
+impl EditableCode {
+    /// Leave the nested editor, placing the document caret at `offset`, or
+    /// reveal the block's source at `fallback` when `offset` is unavailable.
+    fn exit(&self, offset: Option<usize>, fallback: usize, window: &mut Window, cx: &mut App) {
+        let Some(document) = self.document.upgrade() else {
+            return;
+        };
+        let offset = offset.unwrap_or_else(|| {
+            self.focus.borrow_mut().revealed = Some(self.code.ordinal);
+            fallback
+        });
+        document.update(cx, |document, cx| {
+            document.set_selected_range(offset..offset, cx);
+            document.focus(window, cx);
+        });
+    }
+
+    pub(super) fn render(self: &Rc<Self>, window: &mut Window, cx: &mut App) -> AnyElement {
+        let code = &self.code;
+        let editor = window.use_keyed_state(
+            SharedString::from(format!(
+                "markdown-code-editor-{:?}-{}",
+                self.document_id, code.ordinal
+            )),
+            cx,
+            {
+                let document = self.document.clone();
+                let lang = code.lang.clone();
+                let text = code.code.clone();
+                move |window, cx| CodeEditor::new(document, lang, text, window, cx)
+            },
+        );
+        editor.update(cx, |editor, cx| editor.sync(code, window, cx));
+        let nested = editor.read(cx).editor.clone();
+        #[cfg(test)]
+        tests::LAST_EDITOR.with(|last| *last.borrow_mut() = Some(nested.clone()));
+
+        let pending = self
+            .focus
+            .borrow_mut()
+            .pending
+            .take_if(|(ordinal, _)| *ordinal == code.ordinal);
+        if let Some((_, offset)) = pending {
+            let nested = nested.clone();
+            window.defer(cx, move |window, cx| {
+                nested.update(cx, |nested, cx| {
+                    nested.set_selected_range(offset..offset, cx);
+                    nested.focus(window, cx);
+                });
+            });
+        }
+
+        let editable = self
+            .document
+            .upgrade()
+            .is_some_and(|document| document.read(cx).is_editable());
+        // Size the editor from the line height it actually laid out, so its
+        // viewport holds every row and nothing is left to scroll vertically.
+        let line_height = nested
+            .read(cx)
+            .line_height()
+            .unwrap_or_else(|| code_block::line_height(cx));
+        let rows = code.code.split('\n').count();
+        let start = self.lines.start;
+        let bounds = Rc::new(std::cell::Cell::new(Bounds::<Pixels>::default()));
+
+        div()
+            .id(SharedString::from(format!(
+                "markdown-code-{:?}-{}",
+                self.document_id, code.ordinal
+            )))
+            .debug_selector(move || format!("markdown-live-block-{start}"))
+            .relative()
+            .w_full()
+            .py_1()
+            .child(code_block::frame(
+                start,
+                code.lang.clone(),
+                code.code.clone(),
+                div()
+                    .debug_selector(move || format!("markdown-code-editor-{start}"))
+                    .w_full()
+                    // The nested editor owns clicks inside the code.
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    // A vertical wheel with Shift scrolls long lines, for mice
+                    // without a horizontal wheel. Plain vertical wheels keep
+                    // scrolling the document.
+                    .on_scroll_wheel({
+                        let nested = nested.clone();
+                        move |event: &ScrollWheelEvent, _, cx| {
+                            let delta = event.delta.pixel_delta(line_height);
+                            if !event.modifiers.shift || delta.y.abs() <= delta.x.abs() {
+                                return;
+                            }
+                            nested.update(cx, |nested, cx| {
+                                let offset = nested.scroll_offset();
+                                let x = offset.x + delta.y;
+                                if x.min(px(0.)) != offset.x {
+                                    cx.stop_propagation();
+                                    nested.set_scroll_offset(point(x, offset.y), cx);
+                                }
+                            });
+                        }
+                    })
+                    .capture_action({
+                        let this = self.clone();
+                        let nested = nested.clone();
+                        move |_: &MoveUp, window, cx| {
+                            let (text, caret) = caret(&nested, cx);
+                            if caret.is_empty() && !text[..caret.start].contains('\n') {
+                                cx.stop_propagation();
+                                this.exit_before(window, cx);
+                            }
+                        }
+                    })
+                    .capture_action({
+                        let this = self.clone();
+                        let nested = nested.clone();
+                        move |_: &MoveLeft, window, cx| {
+                            if caret(&nested, cx).1 == (0..0) {
+                                cx.stop_propagation();
+                                this.exit_before(window, cx);
+                            }
+                        }
+                    })
+                    .capture_action({
+                        let this = self.clone();
+                        let nested = nested.clone();
+                        move |_: &MoveDown, window, cx| {
+                            let (text, caret) = caret(&nested, cx);
+                            if caret.is_empty() && !text[caret.end..].contains('\n') {
+                                cx.stop_propagation();
+                                this.exit_after(window, cx);
+                            }
+                        }
+                    })
+                    .capture_action({
+                        let this = self.clone();
+                        let nested = nested.clone();
+                        move |_: &MoveRight, window, cx| {
+                            let (text, caret) = caret(&nested, cx);
+                            if caret.is_empty() && caret.end == text.len() {
+                                cx.stop_propagation();
+                                this.exit_after(window, cx);
+                            }
+                        }
+                    })
+                    .capture_action({
+                        let this = self.clone();
+                        let nested = nested.clone();
+                        move |_: &Escape, window, cx| {
+                            cx.stop_propagation();
+                            let offset = this.code.content.start + caret(&nested, cx).1.start;
+                            this.exit(None, offset, window, cx);
+                        }
+                    })
+                    .child(
+                        Editor::new(&nested)
+                            .appearance(false)
+                            .bordered(false)
+                            .readonly(!editable)
+                            .font_family(cx.theme().mono_font_family.clone())
+                            .text_size(cx.theme().mono_font_size)
+                            .line_height(line_height)
+                            .h((line_height * rows as f32 + px(EDITOR_PADDING_Y * 2.)).ceil()),
+                    ),
+                cx,
+            ))
+            .child(
+                canvas(
+                    {
+                        let bounds = bounds.clone();
+                        move |measured, _, _| bounds.set(measured)
+                    },
+                    |_, _, _, _| {},
+                )
+                .absolute()
+                .top_0()
+                .left_0()
+                .size_full(),
+            )
+            // A click on the header reveals the fences, e.g. to change the language.
+            .on_mouse_down(MouseButton::Left, {
+                let this = self.clone();
+                move |event, window, cx| {
+                    cx.stop_propagation();
+                    let anchor = if event.position.y <= bounds.get().center().y {
+                        this.lines.start
+                    } else {
+                        this.lines.end
+                    };
+                    this.exit(None, anchor, window, cx);
+                }
+            })
+            .into_any_element()
+    }
+
+    fn exit_before(&self, window: &mut Window, cx: &mut App) {
+        let offset = self.lines.start.checked_sub(1);
+        self.exit(offset, self.lines.start, window, cx);
+    }
+
+    fn exit_after(&self, window: &mut Window, cx: &mut App) {
+        let len = self
+            .document
+            .upgrade()
+            .map_or(0, |document| document.read(cx).text().len());
+        let offset = (self.lines.end < len).then_some(self.lines.end + 1);
+        self.exit(offset, self.lines.end, window, cx);
+    }
+}
+
+fn caret(editor: &Entity<EditorState>, cx: &App) -> (SharedString, Range<usize>) {
+    let editor = editor.read(cx);
+    (editor.value(), editor.selected_range())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    thread_local! {
+        pub(super) static LAST_EDITOR: RefCell<Option<Entity<EditorState>>> = const { RefCell::new(None) };
+    }
+
+    fn parse(source: &str) -> Option<FencedCode> {
+        let root = markdown::to_mdast(source, &markdown::ParseOptions::gfm()).unwrap();
+        let markdown::mdast::Node::Code(code) = &root.children().unwrap()[0] else {
+            panic!("expected code");
+        };
+        let position = code.position.as_ref().unwrap();
+        fenced_code(
+            source,
+            &(position.start.offset..position.end.offset),
+            code.lang.as_deref(),
+            &code.value,
+            0,
+        )
+    }
+
+    #[test]
+    fn fenced_code_maps_the_lines_between_fences() {
+        let code = parse("```rust\nlet niño = \"世界\";\n```").unwrap();
+        assert_eq!(code.lang.as_deref(), Some("rust"));
+        assert_eq!(code.code.as_ref(), "let niño = \"世界\";");
+        assert_eq!(code.content, 8..8 + "let niño = \"世界\";\n".len());
+
+        let empty = parse("~~~\n~~~").unwrap();
+        assert_eq!((empty.code.as_ref(), empty.content), ("", 4..4));
+        assert_eq!(lines(""), "");
+        assert_eq!(lines("a\nb"), "a\nb\n");
+    }
+
+    /// Scroll long code lines with a wheel, click the top-left corner of the
+    /// code, and return the offset within the code where typing lands.
+    fn offset_after_wheel(
+        cx: &mut gpui::TestAppContext,
+        delta_x: f32,
+        delta_y: f32,
+        shift: bool,
+    ) -> usize {
+        use crate::input::markdown::tests::{editor, redraw};
+        use gpui::{Modifiers, ScrollDelta};
+
+        cx.update(crate::init);
+        let code = vec!["x".repeat(400); 3].join("\n");
+        let source = format!("intro\n\n```\n{code}\n```\n\nend");
+        let (_, state, cx) = editor(cx, &source);
+        let body = cx.debug_bounds("markdown-code-editor-7").unwrap();
+        cx.simulate_event(ScrollWheelEvent {
+            position: body.origin + point(px(20.), px(20.)),
+            delta: ScrollDelta::Pixels(point(px(delta_x), px(delta_y))),
+            modifiers: Modifiers {
+                shift,
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        redraw(cx);
+        let body = cx.debug_bounds("markdown-code-editor-7").unwrap();
+        cx.simulate_click(
+            point(
+                body.origin.x + px(12.),
+                body.origin.y + px(EDITOR_PADDING_Y + 3.),
+            ),
+            Modifiers::default(),
+        );
+        redraw(cx);
+        cx.simulate_input("Z");
+        redraw(cx);
+        let value = state.read_with(cx, |state, _| state.value());
+        value.find('Z').unwrap() - "intro\n\n```\n".len()
+    }
+
+    #[gpui::test]
+    fn code_editor_viewport_fits_every_row(cx: &mut gpui::TestAppContext) {
+        use crate::input::markdown::tests::{editor, redraw};
+        use gpui::{Modifiers, ScrollDelta};
+
+        cx.update(crate::init);
+        let (_, _, cx) = editor(cx, "intro\n\n```rust\none\ntwo\nthree\nfour\n```\n\nend");
+        let body = cx.debug_bounds("markdown-code-editor-7").unwrap();
+        cx.simulate_event(ScrollWheelEvent {
+            position: body.center(),
+            delta: ScrollDelta::Pixels(point(px(0.), px(-200.))),
+            modifiers: Modifiers::default(),
+            ..Default::default()
+        });
+        redraw(cx);
+        let nested = LAST_EDITOR.with(|last| last.borrow().clone()).unwrap();
+        assert_eq!(
+            nested.read_with(cx, |nested, _| nested.scroll_offset()),
+            point(px(0.), px(0.))
+        );
+    }
+
+    #[gpui::test]
+    fn horizontal_wheels_scroll_long_lines(cx: &mut gpui::TestAppContext) {
+        assert!((10..400).contains(&offset_after_wheel(cx, -200., 0., false)));
+    }
+
+    #[gpui::test]
+    fn shift_wheels_scroll_long_lines(cx: &mut gpui::TestAppContext) {
+        assert!((10..400).contains(&offset_after_wheel(cx, 0., -200., true)));
+    }
+
+    #[test]
+    fn unclosed_or_indented_fences_stay_source_edited() {
+        assert!(parse("```\nopen").is_none());
+        assert!(parse("  ```\n  code\n  ```").is_none());
+        assert!(parse("````\ncode\n```").is_none());
+    }
+}
