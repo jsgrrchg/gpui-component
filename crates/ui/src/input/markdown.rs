@@ -303,6 +303,25 @@ impl MarkdownDocument {
                         .any(|child| matches!(child, Node::Image(_) | Node::ImageReference(_)))
                 });
         if rendered_block {
+            // While a task list's source is revealed, Zeron's composer keeps
+            // the markers of inactive lines as checkbox glyphs.
+            for task in &tasks {
+                let bullet = matches!(source.as_bytes()[task.start], b'-' | b'*' | b'+');
+                let start = if bullet {
+                    task.start
+                } else {
+                    task.marker.start - 1
+                };
+                let checked = &source[task.marker.clone()] != " ";
+                self.markup.push(Markup {
+                    range: line_range(source, &(task.start..task.marker.end)),
+                    mark: None,
+                    replacements: vec![replacement(
+                        start..task.marker.end + 1,
+                        if checked { "☑" } else { "☐" },
+                    )],
+                });
+            }
             self.blocks.push(Block {
                 range: line_range(source, &range),
                 source_start: range.start,
@@ -1124,6 +1143,16 @@ mod tests {
         );
         assert_eq!(projected(source, 9..9, true), "bold and italic and code");
         assert_eq!(projected(source, 0..0, false), "bold and italic and code");
+    }
+
+    #[test]
+    fn revealed_tasks_show_checkbox_glyphs_outside_the_active_line() {
+        let source = "- [x] done\n- [ ] todo\n1. [X] ordered\n> - [ ] quoted\n\nend";
+        let todo = source.find("todo").unwrap();
+        assert_eq!(
+            projected(source, todo..todo, true),
+            "☑ done\n- [ ] todo\n1. ☑ ordered\n> ☐ quoted\n\nend"
+        );
     }
 
     #[test]

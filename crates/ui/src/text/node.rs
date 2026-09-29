@@ -16,9 +16,7 @@ use markdown::mdast;
 use ropey::Rope;
 
 use crate::{
-    ActiveTheme as _, Disableable as _, Icon, IconName, StyledExt,
-    checkbox::Checkbox,
-    h_flex,
+    ActiveTheme as _, Icon, IconName, StyledExt, h_flex,
     highlighter::{HighlightTheme, LanguageRegistry, SyntaxHighlighter},
     input::{InputEdit, Point, RopeExt as _},
     scroll::horizontal_scroll_area,
@@ -1793,20 +1791,59 @@ impl BlockNode {
             })
             .when_some(checked, |this, checked| {
                 if let Some(handler) = node_cx.task_toggle_handler.clone() {
+                    // Zeron's task checkbox: a 16px square filled with the
+                    // accent when checked.
                     return this.child(
                         div()
+                            .flex_none()
+                            .min_w(px(18.))
+                            .mt(rems(0.25))
+                            .mr(px(8.))
                             .debug_selector(|| "markdown-live-task-checkbox".into())
                             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                             .child(
                                 div()
                                     .debug_selector(move || format!("markdown-task-{task_offset}"))
                                     .child(
-                                        Checkbox::new(("task", task_offset))
+                                        gpui_base::Checkbox::new(("task", task_offset))
                                             .checked(checked)
                                             .tab_stop(false)
                                             .disabled(node_cx.task_list_readonly)
-                                            .on_click(move |checked, window, cx| {
-                                                handler(task_offset, *checked, window, cx);
+                                            .when(!node_cx.task_list_readonly, |this| {
+                                                this.cursor_pointer()
+                                            })
+                                            .styles(|styles| {
+                                                styles.disabled(|style| style.opacity(0.5))
+                                            })
+                                            .size(px(16.))
+                                            .flex()
+                                            .items_center()
+                                            .justify_center()
+                                            .border_1()
+                                            .rounded(px(3.))
+                                            .map(|this| {
+                                                if checked {
+                                                    this.border_color(cx.theme().primary)
+                                                        .bg(cx.theme().primary)
+                                                        .child(
+                                                            Icon::new(IconName::Check)
+                                                                .size(px(12.))
+                                                                .text_color(
+                                                                    cx.theme().primary_foreground,
+                                                                ),
+                                                        )
+                                                } else {
+                                                    this.border_color(cx.theme().border)
+                                                }
+                                            })
+                                            .on_change(move |state, _, window, cx| {
+                                                cx.stop_propagation();
+                                                handler(
+                                                    task_offset,
+                                                    state == gpui_base::CheckboxState::Checked,
+                                                    window,
+                                                    cx,
+                                                );
                                             }),
                                     ),
                             ),
