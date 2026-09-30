@@ -545,6 +545,8 @@ struct MarkdownDisplay {
     state: WeakEntity<EditorState>,
     text: super::Rope,
     document: MarkdownDocument,
+    /// Keep the projection stable during mouse selection, including mouse down.
+    last_display: Option<EditorDisplay>,
     code_focus: Rc<RefCell<code_editor::CodeFocus>>,
     /// Tasks whose checkbox glyph is currently shown.
     task_glyphs: Vec<Task>,
@@ -562,6 +564,7 @@ fn display_state(
                 state: weak,
                 text: super::Rope::new(),
                 document: MarkdownDocument::default(),
+                last_display: None,
                 code_focus: Rc::default(),
                 task_glyphs: Vec::new(),
             }))
@@ -687,7 +690,19 @@ impl EditorDisplayProvider for MarkdownDisplay {
         _: &Window,
         cx: &App,
     ) -> EditorDisplay {
-        if !ropey::extra::esoterica::ropes_are_instances(&self.text, text) {
+        let unchanged = ropey::extra::esoterica::ropes_are_instances(&self.text, text);
+        if unchanged
+            && self
+                .state
+                .upgrade()
+                .is_some_and(|state| state.read(cx).is_selecting())
+            && let Some(display) = &self.last_display
+        {
+            // The selection highlight still follows the real source range, but
+            // revealing syntax here would move the text beneath the pointer.
+            return display.clone();
+        }
+        if !unchanged {
             let source = text.to_string();
             let caches = self
                 .document
@@ -860,6 +875,7 @@ impl EditorDisplayProvider for MarkdownDisplay {
                 }),
             });
         }
+        self.last_display = Some(display.clone());
         display
     }
 }

@@ -13,6 +13,7 @@ pub struct DisplayReplacement {
 }
 
 /// A rendered block replacing complete source lines while they are inactive.
+#[derive(Clone)]
 pub struct EditorDisplayBlock {
     pub range: Range<usize>,
     pub render: Rc<dyn Fn(&mut Window, &mut App) -> AnyElement>,
@@ -27,7 +28,7 @@ pub struct EditorDisplayBlockCache {
 }
 
 /// Application-owned presentation of the editor's source.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct EditorDisplay {
     pub replacements: Vec<DisplayReplacement>,
     pub decorations: Vec<TextDecoration>,

@@ -438,15 +438,19 @@ impl<M: InputModeKind> TextElement<M> {
 
         window.on_mouse_event({
             let state = self.state.clone();
-            move |_: &MouseUpEvent, phase, _, cx| {
-                if !phase.bubble() {
+            move |event: &MouseUpEvent, phase, _, cx| {
+                if !phase.capture() || event.button != MouseButton::Left {
                     return;
                 }
 
-                // Stop auto-scroll when mouse up, and also stop selecting.
-                state.update(cx, |state, _| {
+                // Finish even outside the input or when another element consumes
+                // mouse up. Providers can now reveal the completed selection.
+                state.update(cx, |state, cx| {
                     state.auto_scroll.stop();
-                    state.selecting = false;
+                    if state.selecting {
+                        state.selecting = false;
+                        cx.notify();
+                    }
                 });
             }
         });
@@ -666,16 +670,41 @@ impl<M: InputModeKind> TextElement<M> {
         let mut line_corners = vec![];
 
         // Iterate only over visible (non-hidden) buffer lines
-        for (prev_lines_offset, line) in last_layout
+        for (line_index, (prev_lines_offset, line)) in last_layout
             .visible_line_byte_offsets
             .iter()
             .zip(lines.iter())
+            .enumerate()
         {
             let prev_lines_offset = *prev_lines_offset;
             let line_size = line.size(line_height);
             let line_wrap_width = line_size.width;
 
             let line_origin = point(px(0.), offset_y);
+            let source_end = last_layout
+                .visible_line_byte_offsets
+                .get(line_index + 1)
+                .copied()
+                .unwrap_or(last_layout.visible_range_offset.end);
+            if end_ix <= prev_lines_offset || start_ix >= source_end {
+                offset_y += line_size.height;
+                continue;
+            }
+
+            if line.is_rendered_block() {
+                // A drag may cross a block while its Markdown stays concealed.
+                // Its source has no text positions; select the reserved rectangle
+                // instead of asking the empty shaped rows for a source endpoint.
+                let width = (bounds.size.width - line_number_width - RIGHT_MARGIN).max(px(6.));
+                line_corners.push(Corners {
+                    top_left: line_origin,
+                    top_right: line_origin + point(width, px(0.)),
+                    bottom_left: line_origin + point(px(0.), line_size.height),
+                    bottom_right: line_origin + point(width, line_size.height),
+                });
+                offset_y += line_size.height;
+                continue;
+            }
 
             let line_cursor_start = line.position_for_index(
                 start_ix.saturating_sub(prev_lines_offset),
@@ -689,13 +718,14 @@ impl<M: InputModeKind> TextElement<M> {
             );
 
             if line_cursor_start.is_some() || line_cursor_end.is_some() {
-                let start = line_cursor_start
-                    .unwrap_or_else(|| line.position_for_index(0, last_layout, false).unwrap());
-
-                let end = line_cursor_end.unwrap_or_else(|| {
-                    line.position_for_index(line.len(), last_layout, false)
-                        .unwrap()
-                });
+                let start =
+                    line_cursor_start.or_else(|| line.position_for_index(0, last_layout, false));
+                let end = line_cursor_end
+                    .or_else(|| line.position_for_index(line.len(), last_layout, false));
+                let (Some(start), Some(end)) = (start, end) else {
+                    offset_y += line_size.height;
+                    continue;
+                };
 
                 // Split the selection into multiple items
                 let wrapped_lines =

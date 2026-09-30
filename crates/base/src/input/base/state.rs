@@ -1675,7 +1675,7 @@ impl<M: InputModeKind> InputBaseState<M> {
             }
         }
 
-        self.selecting = true;
+        self.selecting = event.button == MouseButton::Left;
         let offset = self.index_for_mouse_position(event.position);
 
         if M::on_click(self, event, offset, window, cx) {
@@ -1726,9 +1726,13 @@ impl<M: InputModeKind> InputBaseState<M> {
         if self.selected_range.is_empty() {
             self.selection_reversed = false;
         }
+        let was_selecting = self.selecting;
         self.selecting = false;
         self.selected_word_range = None;
         self.auto_scroll.stop();
+        if was_selecting {
+            cx.notify();
+        }
     }
 
     pub(super) fn on_mouse_move(
@@ -2077,6 +2081,11 @@ impl<M: InputModeKind> InputBaseState<M> {
     /// in the underlying rope's byte units.
     pub fn selected_range(&self) -> std::ops::Range<usize> {
         self.selected_range.into()
+    }
+
+    /// Whether a mouse selection is in progress, until the left button is released.
+    pub fn is_selecting(&self) -> bool {
+        self.selecting
     }
 
     pub fn select_all(&mut self, _: &mut Window, cx: &mut Context<Self>) {

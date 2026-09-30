@@ -819,6 +819,14 @@ impl LineLayout {
         self.len
     }
 
+    /// A rendered block reserves visual rows without shaping its source text.
+    pub(crate) fn is_rendered_block(&self) -> bool {
+        self.projection.is_none()
+            && self.len > 0
+            && !self.wrapped_lines.is_empty()
+            && self.wrapped_lines.iter().all(|line| line.len == 0)
+    }
+
     /// Get the position (x, y) for the given index in this line layout.
     ///
     /// - The `offset` is a local byte index in this line layout.

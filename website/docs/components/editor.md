@@ -83,6 +83,10 @@ checkboxes, including nested tasks and tasks inside quotes, update the original
 `[ ]` / `[x]` marker and participate in undo.
 Read-only mode disables task changes while keeping source selection available.
 
+During mouse selection, the live preview keeps its current formatting and
+layout. The selected Markdown source is revealed when the left button is
+released, including when released outside the editor.
+
 Clicking the upper half of a rendered block reveals its source at the start;
 clicking the lower half places the cursor at the end.
 
