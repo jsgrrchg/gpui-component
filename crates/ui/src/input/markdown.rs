@@ -2,6 +2,7 @@ use std::{
     cell::{Cell, RefCell},
     collections::HashMap,
     ops::Range,
+    path::PathBuf,
     rc::Rc,
 };
 
@@ -38,11 +39,12 @@ pub enum MarkdownMode {
     LivePreview,
 }
 
-fn markdown_style(cx: &App) -> TextViewStyle {
+fn markdown_style(cx: &App, image_root: &Option<PathBuf>) -> TextViewStyle {
     TextViewStyle {
         highlight_theme: cx.theme().highlight_theme.clone(),
         is_dark: cx.theme().is_dark(),
         table_appearance: TableAppearance::Plain,
+        image_root: image_root.clone(),
         ..Default::default()
     }
 }
@@ -76,12 +78,16 @@ pub(super) fn reading_preview(
 }
 
 impl Render for MarkdownReadingPreview {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let image_root = display_state(&self.state, window, cx)
+            .borrow()
+            .image_root
+            .clone();
         TextView::markdown(
             SharedString::from(format!("markdown-preview-{:?}", self.state.entity_id())),
             self.state.read(cx).value(),
         )
-        .style(markdown_style(cx))
+        .style(markdown_style(cx, &image_root))
         .markdown_extensions(code_block::extensions())
         .selectable(true)
         .scrollable(true)
@@ -300,7 +306,8 @@ fn replacement(range: Range<usize>, text: impl Into<SharedString>) -> DisplayRep
 impl MarkdownDocument {
     fn parse(source: &str) -> Self {
         let mut document = Self::default();
-        let Ok(root) = markdown::to_mdast(source, &markdown::ParseOptions::gfm()) else {
+        let Ok(root) = crate::text::wiki_image::parse(source, &markdown::ParseOptions::gfm())
+        else {
             return document;
         };
         let definitions = root
@@ -551,6 +558,7 @@ struct MarkdownDisplay {
     code_focus: Rc<RefCell<code_editor::CodeFocus>>,
     /// Tasks whose checkbox glyph is currently shown.
     task_glyphs: Vec<Task>,
+    image_root: Option<PathBuf>,
 }
 
 fn display_state(
@@ -568,6 +576,7 @@ fn display_state(
                 last_display: None,
                 code_focus: Rc::default(),
                 task_glyphs: Vec::new(),
+                image_root: None,
             }))
         })
         .read(cx)
@@ -580,6 +589,24 @@ pub(super) fn provider(
     cx: &mut App,
 ) -> SharedEditorDisplayProvider {
     display_state(state, window, cx)
+}
+
+pub(super) fn set_image_root(
+    state: &Entity<EditorState>,
+    image_root: Option<PathBuf>,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let display = display_state(state, window, cx);
+    let mut display = display.borrow_mut();
+    if display.image_root != image_root {
+        display.image_root = image_root;
+        display.last_display = None;
+        for block in &mut display.document.blocks {
+            block.cache = Rc::default();
+        }
+        state.update(cx, |_, cx| cx.notify());
+    }
 }
 
 /// Paint the checkboxes of tasks whose marker is hidden, over the room
@@ -801,6 +828,7 @@ impl EditorDisplayProvider for MarkdownDisplay {
                 continue;
             }
             let source = block.source.clone();
+            let image_root = self.image_root.clone();
             let state = self.state.clone();
             let range = block.range.clone();
             let tasks = block.tasks.clone();
@@ -817,7 +845,7 @@ impl EditorDisplayProvider for MarkdownDisplay {
                     let task_state = state.clone();
                     let tasks = tasks.clone();
                     let view = TextView::markdown(SharedString::from(id.clone()), source.clone())
-                        .style(markdown_style(cx).paragraph_gap(rems(0.25)))
+                        .style(markdown_style(cx, &image_root).paragraph_gap(rems(0.25)))
                         .markdown_extensions(code_block::extensions())
                         .on_task_toggle(move |offset, checked, window, cx| {
                             if let Some(task) = tasks

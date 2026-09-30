@@ -89,6 +89,27 @@ thin horizontal separators and 12px cell padding. Columns share the available
 width in proportion to their formatted content and scroll horizontally when
 their minimum widths no longer fit.
 
+Image embeds support NeverWrite/Obsidian syntax: `![[/assets/photo.png|400]]`
+sets a 400px width, while `![[/assets/photo.png]]` uses the natural size.
+Images in their own paragraphs are centered, with 8px vertical padding,
+6px rounded corners and a maximum height of 500px, matching NeverWrite.
+The image keeps its proportions and fits the available width. Both preview
+modes render these embeds; source editing, copy and undo keep the original syntax.
+Escaped embeds and embeds inside code remain literal text.
+
+Configure the image root explicitly for local files:
+
+```rust
+Editor::new(&state)
+    .markdown_mode(MarkdownMode::LivePreview)
+    .markdown_image_root("/path/to/vault")
+```
+
+Paths beginning with `/` are relative to this root, as in NeverWrite. Relative
+paths also resolve from the root. Local images cannot escape it through `..`
+or symlinks. Ordinary Markdown images use the same root. Without a root, images
+remain URI-backed. This does not import or save pasted/dropped image files.
+
 During mouse selection, the live preview keeps its current formatting and
 layout. The selected Markdown source is revealed when the left button is
 released, including when released outside the editor.

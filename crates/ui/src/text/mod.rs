@@ -10,6 +10,7 @@ mod state;
 mod style;
 mod text_view;
 mod utils;
+pub(crate) mod wiki_image;
 #[cfg(test)]
 mod window_selection;
 

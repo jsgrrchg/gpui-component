@@ -1,4 +1,5 @@
 use gpui::{ImageSource, SharedUri};
+use std::{path::Path, sync::Arc};
 
 const NUMBERED_PREFIXES_1: &str = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
 const NUMBERED_PREFIXES_2: &str = "abcdefghijklmnopqrstuvwxyz";
@@ -43,6 +44,17 @@ pub(super) fn list_item_prefix(ix: usize, ordered: bool, depth: usize) -> String
 /// scheme-less strings.
 pub(super) fn image_source(url: &SharedUri) -> ImageSource {
     url.clone().into()
+}
+
+/// Local files are opt-in and stay inside the configured root.
+pub(super) fn local_image_path(url: &str, root: Option<&Path>) -> Option<Arc<Path>> {
+    // Keep URLs on the URI loader. A leading slash means vault-root-relative.
+    if url.contains(':') || url.starts_with("//") {
+        return None;
+    }
+    let root = root?.canonicalize().ok()?;
+    let path = root.join(url.trim_start_matches('/')).canonicalize().ok()?;
+    (path.starts_with(&root) && path.is_file()).then(|| path.into())
 }
 
 #[cfg(test)]

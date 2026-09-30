@@ -30,6 +30,16 @@ let editor = cx.new(|cx| {
 Editor::new(&editor).markdown_mode(MarkdownMode::LivePreview)
 ```
 
+## Images
+
+Images are centered and keep their proportions. Click the image to edit its source,
+then move the caret outside its paragraph to show the image again.
+
+![[/assets/paisaje-lago.png|400]]
+
+Change `400` to `200`, or remove `|400` to use the image's natural size.
+Relative paths work too: `![[assets/paisaje-lago.png|200]]`.
+
 ## Tables
 
 | Mode | What you see | Editable |

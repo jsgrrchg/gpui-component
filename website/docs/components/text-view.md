@@ -108,6 +108,24 @@ TextView::markdown("table", "| Name | Value |\n| --- | --- |\n| Example | 42 |")
     .style(TextViewStyle::default().table_appearance(TableAppearance::Plain))
 ```
 
+## Image Embeds
+
+Markdown views support `![[image.png]]` and `![[image.png|400]]` alongside
+ordinary `![alt](url)` images. The optional positive integer is a width in pixels.
+Rendered-to-Markdown copy preserves the embed syntax.
+Images in their own paragraphs are centered, with 8px vertical padding,
+6px rounded corners and a maximum height of 500px.
+
+For local images, use an explicit image root:
+
+```rust
+TextView::markdown("images", "![[/assets/photo.png|400]]")
+    .style(TextViewStyle::default().image_root("/path/to/vault"))
+```
+
+Leading `/` and relative image paths resolve inside this root. Files outside
+the root are not loaded. HTTP(S) images continue to use the URI loader.
+
 ## Markdown Plugins
 
 Use `.plugin(...)` to support custom Markdown formats. A plugin owns both parsing and rendering, so callers only need to attach it to the `TextView`:

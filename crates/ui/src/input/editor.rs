@@ -1,4 +1,4 @@
-use std::rc::Rc;
+use std::{path::PathBuf, rc::Rc};
 
 use gpui::{
     App, DefiniteLength, Entity, InteractiveElement as _, IntoElement, ParentElement, RenderOnce,
@@ -20,6 +20,7 @@ pub struct Editor {
     disabled: bool,
     readonly: bool,
     markdown_mode: Option<MarkdownMode>,
+    markdown_image_root: Option<PathBuf>,
     tab_index: isize,
     role: RoleOverride,
     aria_label: Option<SharedString>,
@@ -41,6 +42,7 @@ impl Editor {
             disabled: false,
             readonly: false,
             markdown_mode: None,
+            markdown_image_root: None,
             tab_index: 0,
             role: RoleOverride::default(),
             aria_label: None,
@@ -90,6 +92,14 @@ impl Editor {
         self
     }
 
+    /// Root for local Markdown images, including `![[/assets/photo.png|400]]`.
+    /// Both `/assets/photo.png` and `assets/photo.png` resolve inside this root.
+    /// Other Markdown views of the same state inherit this root.
+    pub fn markdown_image_root(mut self, root: impl Into<PathBuf>) -> Self {
+        self.markdown_image_root = Some(root.into());
+        self
+    }
+
     pub fn role(mut self, role: impl Into<RoleOverride>) -> Self {
         self.role = role.into();
         self
@@ -122,6 +132,9 @@ impl Styled for Editor {
 impl RenderOnce for Editor {
     fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
         if let Some(mode) = self.markdown_mode {
+            if let Some(root) = self.markdown_image_root {
+                super::markdown::set_image_root(&self.state, Some(root), window, cx);
+            }
             if mode == MarkdownMode::Preview {
                 return gpui::div()
                     .size_full()

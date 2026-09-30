@@ -233,6 +233,10 @@ impl Render for EditorStory {
                         div().flex_1().min_w_0().h_full().child(
                             Editor::new(&self.markdown_state)
                                 .markdown_mode(self.markdown_mode)
+                                .markdown_image_root(concat!(
+                                    env!("CARGO_MANIFEST_DIR"),
+                                    "/src/stories/editor_assets"
+                                ))
                                 .readonly(self.readonly)
                                 .size_full(),
                         ),
@@ -241,6 +245,10 @@ impl Render for EditorStory {
                         div().flex_1().min_w_0().h_full().child(
                             Editor::new(&self.markdown_state)
                                 .markdown_mode(MarkdownMode::Preview)
+                                .markdown_image_root(concat!(
+                                    env!("CARGO_MANIFEST_DIR"),
+                                    "/src/stories/editor_assets"
+                                ))
                                 .size_full(),
                         )
                     }))

@@ -458,9 +458,18 @@ pub struct ImageNode {
     pub alt: Option<SharedString>,
     pub width: Option<DefiniteLength>,
     pub height: Option<DefiniteLength>,
+    /// Preserve wiki embed spelling when copying rendered content as Markdown.
+    pub markdown: Option<SharedString>,
 }
 
 impl ImageNode {
+    pub(super) fn source(&self, root: Option<&std::path::Path>) -> gpui::ImageSource {
+        super::utils::local_image_path(&self.url, root).map_or_else(
+            || image_source(&self.url),
+            |path| gpui::ImageSource::Resource(gpui::Resource::Path(path)),
+        )
+    }
+
     pub fn title(&self) -> String {
         self.title
             .clone()
@@ -477,6 +486,7 @@ impl PartialEq for ImageNode {
             && self.alt == other.alt
             && self.width == other.width
             && self.height == other.height
+            && self.markdown == other.markdown
     }
 }
 
@@ -598,6 +608,9 @@ fn emit_run(
 
 /// The Markdown source for an inline image, e.g. `![alt](url "title")`.
 fn image_markdown(image: &ImageNode) -> String {
+    if let Some(markdown) = &image.markdown {
+        return markdown.to_string();
+    }
     let alt = image.alt.clone().unwrap_or_default();
     let title = image
         .title
@@ -1305,8 +1318,10 @@ impl Paragraph {
     fn render(&self, node_cx: &NodeContext, _window: &mut Window, cx: &mut App) -> AnyElement {
         let span = self.span;
         let children = &self.children;
+        let image_only = children.iter().any(|node| node.image.is_some())
+            && children.iter().all(|node| node.text.trim().is_empty());
 
-        if self.should_render_inline_flow() {
+        if !image_only && self.should_render_inline_flow() {
             return InlineFlow::new(
                 span.unwrap_or_default(),
                 self.inline_flow_items(node_cx, cx),
@@ -1324,6 +1339,9 @@ impl Paragraph {
 
         let mut ix = 0;
         for inline_node in children {
+            if image_only && inline_node.image.is_none() {
+                continue;
+            }
             let text_len = inline_node.text.len();
             text.push_str(&inline_node.text);
 
@@ -1344,46 +1362,59 @@ impl Paragraph {
                     );
                 }
                 let link_click_handler = node_cx.link_click_handler.clone();
-                child_nodes.push(
-                    img(image_source(&image.url))
-                        .id(ix)
-                        .object_fit(ObjectFit::Contain)
-                        .max_w(relative(1.))
-                        .when_some(image.width, |this, width| this.w(width))
-                        .when_some(image.link.clone(), |this, link| {
-                            let title = image.title();
-                            let link_click_handler = link_click_handler.clone();
-                            let aux_link = link.clone();
-                            let aux_link_click_handler = link_click_handler.clone();
-                            this.cursor_pointer()
-                                .tooltip(move |window, cx| {
-                                    Tooltip::new(title.clone()).build(window, cx)
-                                })
-                                .on_click(move |event, window, cx| {
-                                    gpui_base::TextSelection::end(window, cx);
-                                    cx.stop_propagation();
-                                    handle_link_click(
-                                        &link_click_handler,
-                                        link.url.clone(),
-                                        event.clone(),
-                                        window,
-                                        cx,
-                                    );
-                                })
-                                .on_aux_click(move |event, window, cx| {
-                                    gpui_base::TextSelection::end(window, cx);
-                                    cx.stop_propagation();
-                                    handle_link_click(
-                                        &aux_link_click_handler,
-                                        aux_link.url.clone(),
-                                        event.clone(),
-                                        window,
-                                        cx,
-                                    );
-                                })
-                        })
-                        .into_any_element(),
-                );
+                let image_element = img(image.source(node_cx.style.image_root.as_deref()))
+                    .id(ix)
+                    .object_fit(ObjectFit::Contain)
+                    .max_w(relative(1.))
+                    .when(image_only, |this| this.max_h(px(500.)).rounded(px(6.)))
+                    .when_some(image.width, |this, width| this.w(width))
+                    .when_some(image.height, |this, height| this.h(height))
+                    .when_some(image.link.clone(), |this, link| {
+                        let title = image.title();
+                        let link_click_handler = link_click_handler.clone();
+                        let aux_link = link.clone();
+                        let aux_link_click_handler = link_click_handler.clone();
+                        this.cursor_pointer()
+                            .tooltip(move |window, cx| {
+                                Tooltip::new(title.clone()).build(window, cx)
+                            })
+                            .on_click(move |event, window, cx| {
+                                gpui_base::TextSelection::end(window, cx);
+                                cx.stop_propagation();
+                                handle_link_click(
+                                    &link_click_handler,
+                                    link.url.clone(),
+                                    event.clone(),
+                                    window,
+                                    cx,
+                                );
+                            })
+                            .on_aux_click(move |event, window, cx| {
+                                gpui_base::TextSelection::end(window, cx);
+                                cx.stop_propagation();
+                                handle_link_click(
+                                    &aux_link_click_handler,
+                                    aux_link.url.clone(),
+                                    event.clone(),
+                                    window,
+                                    cx,
+                                );
+                            })
+                    })
+                    .into_any_element();
+                child_nodes.push(if image_only {
+                    // NeverWrite centers block images with 8px vertical spacing.
+                    div()
+                        .w_full()
+                        .min_w_0()
+                        .flex()
+                        .justify_center()
+                        .py(px(8.))
+                        .child(image_element)
+                        .into_any_element()
+                } else {
+                    image_element
+                });
 
                 text.clear();
                 links.clear();
@@ -1465,6 +1496,7 @@ impl Paragraph {
 
         div()
             .id(span.unwrap_or_default())
+            .when(image_only, |this| this.w_full().min_w_0())
             .children(child_nodes)
             .into_any_element()
     }
@@ -1500,7 +1532,7 @@ impl Paragraph {
                 }
 
                 items.push(InlineFlowItem::Image {
-                    url: image.url.clone(),
+                    source: image.source(node_cx.style.image_root.as_deref()),
                     link: image.link.clone(),
                     title: image.title(),
                     width: image.width,
@@ -1611,12 +1643,7 @@ impl Paragraph {
                 }
 
                 if let Some(image) = &text_node.image {
-                    let alt = image.alt.clone().unwrap_or_default();
-                    let title = image
-                        .title
-                        .clone()
-                        .map_or(String::new(), |t| format!(" \"{}\"", t));
-                    text.push_str(&format!("![{}]({}{})", alt, image.url, title))
+                    text.push_str(&image_markdown(image));
                 }
 
                 text

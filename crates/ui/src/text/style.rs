@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{path::PathBuf, sync::Arc};
 
 use gpui::{App, HighlightStyle, Pixels, Rems, StyleRefinement, px, rems};
 
@@ -49,6 +49,9 @@ pub struct TextViewStyle {
     pub table_cell: StyleRefinement,
     /// Table appearance, default is [`TableAppearance::Bordered`].
     pub table_appearance: TableAppearance,
+    /// Explicit root for local Markdown images. `/assets/a.png` is relative
+    /// to this root; relative paths also start here. Default: URI images only.
+    pub image_root: Option<PathBuf>,
     /// The highlight style for inline code.
     ///
     /// Default is [`HighlightStyle::default()`], the `background_color` will
@@ -74,6 +77,7 @@ impl PartialEq for TextViewStyle {
             && self.table == other.table
             && self.table_cell == other.table_cell
             && self.table_appearance == other.table_appearance
+            && self.image_root == other.image_root
             && self.inline_code == other.inline_code
             && self.is_dark == other.is_dark
     }
@@ -90,6 +94,7 @@ impl Default for TextViewStyle {
             table: StyleRefinement::default(),
             table_cell: StyleRefinement::default(),
             table_appearance: TableAppearance::default(),
+            image_root: None,
             inline_code: HighlightStyle::default(),
             is_dark: false,
         }
@@ -97,6 +102,12 @@ impl Default for TextViewStyle {
 }
 
 impl TextViewStyle {
+    /// Resolve local Markdown image paths inside an application-owned root.
+    pub fn image_root(mut self, root: impl Into<PathBuf>) -> Self {
+        self.image_root = Some(root.into());
+        self
+    }
+
     /// Set paragraph gap, default is 1 rem.
     pub fn paragraph_gap(mut self, gap: Rems) -> Self {
         self.paragraph_gap = gap;
