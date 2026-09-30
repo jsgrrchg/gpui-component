@@ -21,6 +21,20 @@ pub use style::*;
 pub use text_view::*;
 
 pub(crate) fn init(cx: &mut App) {
+    // Use actual faces, as Comet does: GPUI's platform font fallback can
+    // discard a requested weight when the inherited family is unavailable.
+    let fonts: Vec<std::borrow::Cow<'static, [u8]>> = [
+        include_bytes!("../../assets/fonts/Geist.ttf").as_slice(),
+        include_bytes!("../../assets/fonts/Geist-Bold.ttf").as_slice(),
+        include_bytes!("../../assets/fonts/Geist-Italic.ttf").as_slice(),
+        include_bytes!("../../assets/fonts/Geist-BoldItalic.ttf").as_slice(),
+    ]
+    .into_iter()
+    .map(std::borrow::Cow::Borrowed)
+    .collect();
+    if let Err(error) = cx.text_system().add_fonts(fonts) {
+        tracing::warn!(%error, "failed to register Markdown table fonts");
+    }
     state::init(cx);
 }
 

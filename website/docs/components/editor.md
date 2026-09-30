@@ -83,6 +83,12 @@ checkboxes, including nested tasks and tasks inside quotes, update the original
 `[ ]` / `[x]` marker and participate in undo.
 Read-only mode disables task changes while keeping source selection available.
 
+Tables in both preview modes use Comet's frameless appearance and bundled Geist
+font faces (including bold and italic): a bold header,
+thin horizontal separators and 12px cell padding. Columns share the available
+width in proportion to their formatted content and scroll horizontally when
+their minimum widths no longer fit.
+
 During mouse selection, the live preview keeps its current formatting and
 layout. The selected Markdown source is revealed when the left button is
 released, including when released outside the editor.

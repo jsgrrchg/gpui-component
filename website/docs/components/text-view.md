@@ -94,6 +94,20 @@ source and its new checked state. The owner updates the corresponding `[ ]` /
 `[x]` marker and renders the changed source. `task_list_readonly(true)` disables
 the controls. Without a callback, task checkboxes remain a static representation.
 
+## Table Appearance
+
+Use `TableAppearance::Plain` for frameless tables in bundled Geist, with a bold header, thin
+horizontal separators and 12px cell padding. Columns use measured content
+widths to distribute space and scroll horizontally when their minimum widths
+no longer fit.
+
+```rust
+use gpui_component::text::{TableAppearance, TextView, TextViewStyle};
+
+TextView::markdown("table", "| Name | Value |\n| --- | --- |\n| Example | 42 |")
+    .style(TextViewStyle::default().table_appearance(TableAppearance::Plain))
+```
+
 ## Markdown Plugins
 
 Use `.plugin(...)` to support custom Markdown formats. A plugin owns both parsing and rendering, so callers only need to attach it to the `TextView`:

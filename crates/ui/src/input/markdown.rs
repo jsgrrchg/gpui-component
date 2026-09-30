@@ -20,7 +20,7 @@ use markdown::mdast::Node;
 use super::EditorState;
 use crate::{
     ActiveTheme, IconName, IconNamed as _,
-    text::{TextView, TextViewStyle},
+    text::{TableAppearance, TextView, TextViewStyle},
 };
 
 mod code_block;
@@ -42,6 +42,7 @@ fn markdown_style(cx: &App) -> TextViewStyle {
     TextViewStyle {
         highlight_theme: cx.theme().highlight_theme.clone(),
         is_dark: cx.theme().is_dark(),
+        table_appearance: TableAppearance::Plain,
         ..Default::default()
     }
 }

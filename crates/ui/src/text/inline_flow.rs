@@ -697,7 +697,7 @@ fn inline_image_size_for_line(
     size((height * aspect_ratio).max(px(1.)), height.max(px(1.)))
 }
 
-fn runs_for_highlights(
+pub(super) fn runs_for_highlights(
     text: &str,
     default_style: &TextStyle,
     highlights: Vec<(Range<usize>, HighlightStyle)>,

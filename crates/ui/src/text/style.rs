@@ -4,6 +4,18 @@ use gpui::{App, HighlightStyle, Pixels, Rems, StyleRefinement, px, rems};
 
 use crate::{ActiveTheme as _, highlighter::HighlightTheme};
 
+/// Appearance and column layout of Markdown tables.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TableAppearance {
+    /// Bordered cells inside a rounded frame.
+    #[default]
+    Bordered,
+    /// Frameless rows in bundled Geist with a bold header, horizontal rules,
+    /// and content-proportional columns.
+    /// Columns wrap down to their minimum widths, then scroll horizontally.
+    Plain,
+}
+
 /// TextViewStyle used to customize the style for [`TextView`].
 #[derive(Clone)]
 pub struct TextViewStyle {
@@ -35,6 +47,8 @@ pub struct TextViewStyle {
     /// on a single line — columns then never shrink and the table scrolls as
     /// soon as the content is wider than the frame.
     pub table_cell: StyleRefinement,
+    /// Table appearance, default is [`TableAppearance::Bordered`].
+    pub table_appearance: TableAppearance,
     /// The highlight style for inline code.
     ///
     /// Default is [`HighlightStyle::default()`], the `background_color` will
@@ -59,6 +73,7 @@ impl PartialEq for TextViewStyle {
             && self.code_block == other.code_block
             && self.table == other.table
             && self.table_cell == other.table_cell
+            && self.table_appearance == other.table_appearance
             && self.inline_code == other.inline_code
             && self.is_dark == other.is_dark
     }
@@ -74,6 +89,7 @@ impl Default for TextViewStyle {
             code_block: StyleRefinement::default(),
             table: StyleRefinement::default(),
             table_cell: StyleRefinement::default(),
+            table_appearance: TableAppearance::default(),
             inline_code: HighlightStyle::default(),
             is_dark: false,
         }
@@ -124,6 +140,12 @@ impl TextViewStyle {
     /// than the frame.
     pub fn table_cell(mut self, style: StyleRefinement) -> Self {
         self.table_cell = style;
+        self
+    }
+
+    /// Set the table appearance and column layout.
+    pub fn table_appearance(mut self, appearance: TableAppearance) -> Self {
+        self.table_appearance = appearance;
         self
     }
 
