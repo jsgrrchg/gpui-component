@@ -7,8 +7,8 @@ use std::{
 
 use gpui::{
     App, Bounds, Context, Entity, EntityInputHandler, FontStyle, FontWeight, HighlightStyle,
-    InteractiveElement, IntoElement, MouseButton, ParentElement, Pixels, Render, SharedString,
-    Styled, Subscription, WeakEntity, Window, canvas, div, px, rems,
+    InteractiveElement, IntoElement, MouseButton, MouseDownEvent, ParentElement, Pixels, Render,
+    SharedString, Styled, Subscription, WeakEntity, Window, canvas, div, px, rems,
 };
 use gpui_base::input::{
     DisplayReplacement, EditorDisplay, EditorDisplayBlock, EditorDisplayBlockCache,
@@ -95,6 +95,7 @@ enum Mark {
     Code,
     Link,
     Highlight,
+    Task,
 }
 
 struct Markup {
@@ -112,34 +113,80 @@ struct Block {
     cache: Rc<RefCell<EditorDisplayBlockCache>>,
 }
 
+/// Glyphs for task markers shown as source text. U+FE0E asks for the text
+/// presentation; ☑ otherwise resolves to an emoji font that may not render.
+const CHECKED_TASK: &str = "☑\u{FE0E}";
+const UNCHECKED_TASK: &str = "☐\u{FE0E}";
+
 #[derive(Clone)]
 struct Task {
+    /// The list item's start.
     start: usize,
+    /// The ` `, `x` or `X` between the brackets.
     marker: Range<usize>,
+    /// Source shown as a checkbox glyph: the bullet through `]`, or just the
+    /// brackets after an ordered list number.
+    glyph: Range<usize>,
+    /// The item's first line, which reveals the source while it is active.
+    line: Range<usize>,
+    checked: bool,
 }
 
-fn collect_tasks(node: &Node, source: &str, tasks: &mut Vec<Task>) {
-    if let Node::ListItem(item) = node
-        && item.checked.is_some()
-        && let Some(range) = node_range(node)
-    {
+impl Task {
+    fn of(node: &Node, source: &str) -> Option<Self> {
+        let Node::ListItem(item) = node else {
+            return None;
+        };
+        let checked = item.checked?;
+        let range = node_range(node)?;
         let first_line = source[range.clone()].split('\n').next().unwrap_or_default();
-        let marker = if item.checked == Some(true) {
+        let marker = if checked {
             first_line.find("[x]").or_else(|| first_line.find("[X]"))
         } else {
             first_line.find("[ ]")
-        };
-        if let Some(marker) = marker {
-            let marker = range.start + marker + 1;
-            tasks.push(Task {
-                start: range.start,
-                marker: marker..marker + 1,
-            });
-        }
+        }?;
+        let marker = range.start + marker + 1;
+        let bullet = matches!(source.as_bytes()[range.start], b'-' | b'*' | b'+');
+        Some(Self {
+            start: range.start,
+            marker: marker..marker + 1,
+            glyph: if bullet { range.start } else { marker - 1 }..marker + 2,
+            line: line_range(source, &(range.start..marker)),
+            checked,
+        })
     }
+}
+
+fn collect_tasks(node: &Node, source: &str, tasks: &mut Vec<Task>) {
+    tasks.extend(Task::of(node, source));
     for child in node.children().into_iter().flatten() {
         collect_tasks(child, source, tasks);
     }
+}
+
+/// Set a task's marker in the document, keeping its selection.
+fn set_task(
+    state: &Entity<EditorState>,
+    marker: &Range<usize>,
+    checked: bool,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    state.update(cx, |state, cx| {
+        if !state.is_editable() {
+            return;
+        }
+        let selection = state.selected_range();
+        let marker_utf16 = state.text().byte_to_utf16_idx(marker.start)
+            ..state.text().byte_to_utf16_idx(marker.end);
+        state.replace_text_in_range(
+            Some(marker_utf16),
+            if checked { "x" } else { " " },
+            window,
+            cx,
+        );
+        state.set_selected_range(selection, cx);
+    });
 }
 
 /// Replace just escape markers and character references, leaving ordinary
@@ -216,6 +263,8 @@ struct MarkdownDocument {
     links: Vec<(Range<usize>, SharedString)>,
     definitions: String,
     fenced_code_blocks: usize,
+    /// Tasks of lists edited line by line, outside rendered blocks.
+    tasks: Vec<Task>,
 }
 
 fn node_range(node: &Node) -> Option<Range<usize>> {
@@ -282,48 +331,29 @@ impl MarkdownDocument {
         let Some(range) = node_range(node) else {
             return;
         };
-        let mut tasks = Vec::new();
-        if matches!(
+        // Lists stay source lines, so a click reveals just the line under the
+        // caret. Quotes and footnotes render as blocks, tasks included.
+        let rendered_block = matches!(
             node,
-            Node::Blockquote(_) | Node::List(_) | Node::FootnoteDefinition(_)
-        ) {
-            collect_tasks(node, source, &mut tasks);
-        }
-        let rendered_block = !tasks.is_empty()
-            || matches!(
-                node,
-                Node::Heading(_)
-                    | Node::Code(_)
-                    | Node::Table(_)
-                    | Node::Blockquote(_)
-                    | Node::ThematicBreak(_)
-                    | Node::FootnoteDefinition(_)
-            )
-            || matches!(node, Node::Paragraph(_))
-                && node.children().is_some_and(|children| {
-                    children
-                        .iter()
-                        .any(|child| matches!(child, Node::Image(_) | Node::ImageReference(_)))
-                });
+            Node::Heading(_)
+                | Node::Code(_)
+                | Node::Table(_)
+                | Node::Blockquote(_)
+                | Node::ThematicBreak(_)
+                | Node::FootnoteDefinition(_)
+        ) || matches!(node, Node::Paragraph(_))
+            && node.children().is_some_and(|children| {
+                children
+                    .iter()
+                    .any(|child| matches!(child, Node::Image(_) | Node::ImageReference(_)))
+            });
         if rendered_block {
-            // While a task list's source is revealed, Zeron's composer keeps
-            // the markers of inactive lines as checkbox glyphs.
+            let mut tasks = Vec::new();
+            collect_tasks(node, source, &mut tasks);
+            // While a block's source is revealed, its inactive task lines keep
+            // their markers as checkbox glyphs.
             for task in &tasks {
-                let bullet = matches!(source.as_bytes()[task.start], b'-' | b'*' | b'+');
-                let start = if bullet {
-                    task.start
-                } else {
-                    task.marker.start - 1
-                };
-                let checked = &source[task.marker.clone()] != " ";
-                self.markup.push(Markup {
-                    range: line_range(source, &(task.start..task.marker.end)),
-                    mark: None,
-                    replacements: vec![replacement(
-                        start..task.marker.end + 1,
-                        if checked { "☑" } else { "☐" },
-                    )],
-                });
+                self.task_glyph(task);
             }
             let code = if let Node::Code(code) = node {
                 self.fenced_code_blocks += 1;
@@ -348,7 +378,10 @@ impl MarkdownDocument {
             return;
         }
 
-        if let Node::ListItem(item) = node {
+        if let Some(task) = Task::of(node, source) {
+            self.task_glyph(&task);
+            self.tasks.push(task);
+        } else if let Node::ListItem(item) = node {
             if let Some(first) = item.children.first().and_then(node_range) {
                 let prefix = &source[range.start..first.start];
                 if !prefix.contains('\n') && prefix.trim_start().starts_with(['-', '*', '+']) {
@@ -453,6 +486,30 @@ impl MarkdownDocument {
         }
     }
 
+    /// Show a task marker as a checkbox glyph (Zeron's composer), except
+    /// while its line is active.
+    fn task_glyph(&mut self, task: &Task) {
+        self.markup.push(Markup {
+            range: task.line.clone(),
+            mark: None,
+            replacements: vec![replacement(
+                task.glyph.clone(),
+                if task.checked {
+                    CHECKED_TASK
+                } else {
+                    UNCHECKED_TASK
+                },
+            )],
+        });
+        if task.checked {
+            self.markup.push(Markup {
+                range: task.glyph.clone(),
+                mark: Some(Mark::Task),
+                replacements: Vec::new(),
+            });
+        }
+    }
+
     fn highlights(&mut self, text: &str, start: usize) {
         let mut offset = 0;
         while let Some(open) = text[offset..].find("==") {
@@ -502,6 +559,28 @@ struct MarkdownDisplay {
     text: super::Rope,
     document: MarkdownDocument,
     code_focus: Rc<RefCell<code_editor::CodeFocus>>,
+    /// Tasks whose checkbox glyph is currently shown.
+    task_glyphs: Vec<Task>,
+}
+
+fn display_state(
+    state: &Entity<EditorState>,
+    window: &mut Window,
+    cx: &mut App,
+) -> Rc<RefCell<MarkdownDisplay>> {
+    let weak = state.downgrade();
+    window
+        .use_keyed_state(("markdown-display", state.entity_id()), cx, move |_, _| {
+            Rc::new(RefCell::new(MarkdownDisplay {
+                state: weak,
+                text: super::Rope::new(),
+                document: MarkdownDocument::default(),
+                code_focus: Rc::default(),
+                task_glyphs: Vec::new(),
+            }))
+        })
+        .read(cx)
+        .clone()
 }
 
 pub(super) fn provider(
@@ -509,17 +588,37 @@ pub(super) fn provider(
     window: &mut Window,
     cx: &mut App,
 ) -> SharedEditorDisplayProvider {
-    let weak = state.downgrade();
-    let provider =
-        window.use_keyed_state(("markdown-display", state.entity_id()), cx, move |_, _| {
-            Rc::new(RefCell::new(MarkdownDisplay {
-                state: weak,
-                text: super::Rope::new(),
-                document: MarkdownDocument::default(),
-                code_focus: Rc::default(),
-            })) as SharedEditorDisplayProvider
+    display_state(state, window, cx)
+}
+
+/// Toggle a task when its checkbox glyph is clicked, before the editor moves
+/// its caret there and reveals the line's source.
+pub(super) fn task_mouse_down(
+    state: &Entity<EditorState>,
+    window: &mut Window,
+    cx: &mut App,
+) -> impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static {
+    let display = display_state(state, window, cx);
+    let state = state.downgrade();
+    move |event, window, cx| {
+        if event.button != MouseButton::Left || event.modifiers.modified() {
+            return;
+        }
+        let Some(state) = state.upgrade() else {
+            return;
+        };
+        let task = display.borrow().task_glyphs.iter().find_map(|task| {
+            state
+                .read(cx)
+                .range_to_bounds(&task.glyph)
+                .filter(|bounds| bounds.dilate(px(2.)).contains(&event.position))
+                .map(|_| task.clone())
         });
-    provider.read(cx).clone()
+        if let Some(task) = task {
+            cx.stop_propagation();
+            set_task(&state, &task.marker, !task.checked, window, cx);
+        }
+    }
 }
 
 impl EditorDisplayProvider for MarkdownDisplay {
@@ -555,6 +654,14 @@ impl EditorDisplayProvider for MarkdownDisplay {
             }
             self.text = text.clone();
         }
+        let active = focused || !selection.is_empty();
+        self.task_glyphs = self
+            .document
+            .tasks
+            .iter()
+            .filter(|task| !active || !touches(&selection, &task.line))
+            .cloned()
+            .collect();
         let mut display = EditorDisplay {
             replacements: self.document.replacements(&selection, focused),
             ..Default::default()
@@ -594,6 +701,10 @@ impl EditorDisplayProvider for MarkdownDisplay {
                 },
                 Mark::Highlight => HighlightStyle {
                     background_color: Some(cx.theme().warning.opacity(0.25)),
+                    ..Default::default()
+                },
+                Mark::Task => HighlightStyle {
+                    color: Some(cx.theme().primary),
                     ..Default::default()
                 },
             };
@@ -653,22 +764,7 @@ impl EditorDisplayProvider for MarkdownDisplay {
                                 .find(|task| task.start == source_start + offset)
                                 && let Some(state) = task_state.upgrade()
                             {
-                                state.update(cx, |state, cx| {
-                                    if !state.is_editable() {
-                                        return;
-                                    }
-                                    let selection = state.selected_range();
-                                    let marker_utf16 =
-                                        state.text().byte_to_utf16_idx(task.marker.start)
-                                            ..state.text().byte_to_utf16_idx(task.marker.end);
-                                    state.replace_text_in_range(
-                                        Some(marker_utf16),
-                                        if checked { "x" } else { " " },
-                                        window,
-                                        cx,
-                                    );
-                                    state.set_selected_range(selection, cx);
-                                });
+                                set_task(&state, &task.marker, checked, window, cx);
                             }
                         })
                         .task_list_readonly(
@@ -844,6 +940,42 @@ mod tests {
         }
     }
 
+    /// Every task in `source`, with the start of its rendered block, if any.
+    fn task_controls(source: &str) -> Vec<(Task, Option<usize>)> {
+        let document = MarkdownDocument::parse(source);
+        document
+            .tasks
+            .iter()
+            .map(|task| (task.clone(), None))
+            .chain(document.blocks.iter().flat_map(|block| {
+                block
+                    .tasks
+                    .iter()
+                    .map(|task| (task.clone(), Some(block.source_start)))
+            }))
+            .collect()
+    }
+
+    /// Where to click a task: its rendered checkbox inside a block, or its
+    /// checkbox glyph on a source line.
+    fn task_control(
+        cx: &mut VisualTestContext,
+        state: &Entity<EditorState>,
+        task: &Task,
+        block_start: Option<usize>,
+    ) -> Option<Bounds<Pixels>> {
+        match block_start {
+            Some(block_start) => {
+                // GPUI's test lookup requires a static selector.
+                let selector = Box::leak(
+                    format!("markdown-task-{}", task.start - block_start).into_boxed_str(),
+                );
+                cx.debug_bounds(selector)
+            }
+            None => state.read_with(cx, |state, _| state.range_to_bounds(&task.glyph)),
+        }
+    }
+
     #[gpui::test]
     fn nested_and_quoted_tasks_toggle_independently_with_undo_and_readonly(
         cx: &mut TestAppContext,
@@ -855,13 +987,10 @@ mod tests {
             "> - [ ] Parent\n>   - [x] Child\n\nend",
             "- plain\n- [X] Done [ ] literal\n\nend",
         ] {
-            let document = MarkdownDocument::parse(source);
-            let block = document.blocks.first().unwrap();
-            let tasks = block.tasks.clone();
-            let source_start = block.source_start;
+            let tasks = task_controls(source);
             let (content, state, cx) = editor(cx, source);
             let mut expected = source.to_owned();
-            for task in &tasks {
+            for (task, block_start) in &tasks {
                 cx.update(|window, cx| {
                     state.update(cx, |state, cx| {
                         state.set_selected_range(source.len()..source.len(), cx);
@@ -870,12 +999,7 @@ mod tests {
                 });
                 cx.run_until_parked();
                 cx.update(|window, cx| window.draw(cx).clear());
-                // GPUI's test lookup requires a static selector.
-                let selector = Box::leak(
-                    format!("markdown-task-{}", task.start - source_start).into_boxed_str(),
-                );
-                let checkbox = cx
-                    .debug_bounds(selector)
+                let checkbox = task_control(cx, &state, task, *block_start)
                     .expect("every nested task must have a control");
                 let before = expected.clone();
                 let checked = &expected[task.marker.clone()] == " ";
@@ -915,11 +1039,8 @@ mod tests {
             });
             cx.run_until_parked();
             cx.update(|window, cx| window.draw(cx).clear());
-            for task in &tasks {
-                let selector = Box::leak(
-                    format!("markdown-task-{}", task.start - source_start).into_boxed_str(),
-                );
-                let checkbox = cx.debug_bounds(selector).unwrap();
+            for (task, block_start) in &tasks {
+                let checkbox = task_control(cx, &state, task, *block_start).unwrap();
                 cx.simulate_click(checkbox.center(), gpui::Modifiers::default());
                 cx.run_until_parked();
                 assert_eq!(
@@ -985,16 +1106,20 @@ mod tests {
     }
 
     #[test]
-    fn task_blocks_retain_all_nested_source_markers() {
-        for source in [
-            "- [ ] Parent\n  - [x] Child",
-            "> - [ ] Parent\n>   - [X] Child",
+    fn nested_tasks_keep_their_source_markers() {
+        for (source, blocks) in [
+            ("- [ ] Parent\n  - [x] Child", 0),
+            ("> - [ ] Parent\n>   - [X] Child", 1),
         ] {
-            let document = MarkdownDocument::parse(source);
-            assert_eq!(document.blocks.len(), 1);
-            assert_eq!(document.blocks[0].tasks.len(), 2);
-            for task in &document.blocks[0].tasks {
+            assert_eq!(MarkdownDocument::parse(source).blocks.len(), blocks);
+            let tasks = task_controls(source);
+            assert_eq!(tasks.len(), 2);
+            for (task, _) in &tasks {
                 assert!(matches!(&source[task.marker.clone()], " " | "x" | "X"));
+                assert!(matches!(
+                    &source[task.glyph.clone()],
+                    "- [ ]" | "- [x]" | "- [X]"
+                ));
             }
         }
     }
@@ -1249,16 +1374,28 @@ mod tests {
                 .unwrap()
         });
         let state = content.read_with(cx, |view, _| view.state.clone());
+        let end = "- [ ] Task\n\nend".len();
+        cx.update(|window, cx| {
+            state.update(cx, |state, cx| {
+                state.set_selected_range(end..end, cx);
+                state.focus(window, cx);
+            })
+        });
         cx.run_until_parked();
         cx.update(|window, cx| window.draw(cx).clear());
-        let checkbox = cx
-            .debug_bounds("markdown-live-task-checkbox")
-            .expect("task checkbox must be rendered");
+        let checkbox = state
+            .read_with(cx, |state, _| state.range_to_bounds(&(0..5)))
+            .expect("task glyph must be laid out");
         cx.simulate_click(checkbox.center(), gpui::Modifiers::default());
         cx.run_until_parked();
         assert_eq!(
             state.read_with(cx, |state, _| state.value()).as_ref(),
             "- [x] Task\n\nend"
+        );
+        // Toggling neither moves the caret nor reveals the task's source.
+        assert_eq!(
+            state.read_with(cx, |state, _| state.selected_range()),
+            end..end
         );
         content.update(cx, |view, cx| {
             view.readonly = true;
@@ -1266,8 +1403,8 @@ mod tests {
         });
         cx.run_until_parked();
         cx.update(|window, cx| window.draw(cx).clear());
-        let checkbox = cx
-            .debug_bounds("markdown-live-task-checkbox")
+        let checkbox = state
+            .read_with(cx, |state, _| state.range_to_bounds(&(0..5)))
             .expect("read-only task remains visible");
         cx.simulate_click(checkbox.center(), gpui::Modifiers::default());
         cx.run_until_parked();
@@ -1303,7 +1440,54 @@ mod tests {
         let todo = source.find("todo").unwrap();
         assert_eq!(
             projected(source, todo..todo, true),
-            "☑ done\n- [ ] todo\n1. ☑ ordered\n> ☐ quoted\n\nend"
+            "☑\u{FE0E} done\n- [ ] todo\n1. ☑\u{FE0E} ordered\n> ☐\u{FE0E} quoted\n\nend"
+        );
+    }
+
+    #[test]
+    fn list_items_reveal_only_the_active_line() {
+        let source = "- One\n- Two **bold**\n\n- [x] Open\n- [ ] Click";
+        assert!(MarkdownDocument::parse(source).blocks.is_empty());
+        assert_eq!(
+            projected(source, 2..2, true),
+            "- One\n• Two bold\n\n☑\u{FE0E} Open\n☐\u{FE0E} Click"
+        );
+        let click = source.find("Click").unwrap();
+        assert_eq!(
+            projected(source, click..click, true),
+            "• One\n• Two bold\n\n☑\u{FE0E} Open\n- [ ] Click"
+        );
+    }
+
+    #[gpui::test]
+    fn clicking_a_list_item_keeps_the_other_items_in_place(cx: &mut TestAppContext) {
+        cx.update(crate::init);
+        let source = "- One\n- Two\n\n- [x] Open\n- [ ] Click\n\nend";
+        let (_, state, cx) = editor(cx, source);
+        let click = source.find("Click").unwrap();
+        let bounds = |cx: &mut VisualTestContext| {
+            state.read_with(cx, |state, _| {
+                state
+                    .range_to_bounds(&(click..click + 1))
+                    .map(|bounds| bounds.origin.y)
+            })
+        };
+        let before = bounds(cx).unwrap();
+        let one = state
+            .read_with(cx, |state, _| state.range_to_bounds(&(2..3)))
+            .unwrap();
+        cx.simulate_click(one.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+        cx.update(|window, cx| window.draw(cx).clear());
+        let caret = state.read_with(cx, |state, _| state.selected_range());
+        assert!(
+            caret.is_empty() && caret.start <= "- One".len(),
+            "{caret:?}"
+        );
+        assert_eq!(bounds(cx).unwrap(), before);
+        assert_eq!(
+            state.read_with(cx, |state, _| state.value()).as_ref(),
+            source
         );
     }
 
@@ -1336,8 +1520,8 @@ mod tests {
     fn blocks_and_tasks_keep_source_ranges() {
         let source = "# Title\n\n```rust\nlet x = 1;\n```\n\n| A | B |\n| - | - |\n| a | b |\n\n- [ ] Task\n";
         let document = MarkdownDocument::parse(source);
-        assert_eq!(document.blocks.len(), 4);
-        let task = document.blocks.last().unwrap().tasks.first().unwrap();
+        assert_eq!(document.blocks.len(), 3);
+        let task = document.tasks.first().unwrap();
         assert_eq!(&source[task.marker.clone()], " ");
         for block in document.blocks {
             assert!(block.range.start == 0 || source.as_bytes()[block.range.start - 1] == b'\n');

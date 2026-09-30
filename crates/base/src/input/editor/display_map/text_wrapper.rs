@@ -831,6 +831,11 @@ impl LineLayout {
         last_layout: &LastLayout,
         line_end_affinity: bool,
     ) -> Option<Point<Pixels>> {
+        // Mapping clamps offsets past the source line to the display end, so
+        // an offset on a later line must be rejected in source coordinates.
+        if self.projection.is_some() && offset > self.len {
+            return None;
+        }
         let offset = self
             .projection
             .as_ref()

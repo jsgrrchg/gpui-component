@@ -1,8 +1,8 @@
 use std::rc::Rc;
 
 use gpui::{
-    App, DefiniteLength, Entity, IntoElement, ParentElement, RenderOnce, SharedString,
-    StyleRefinement, Styled, Window, prelude::FluentBuilder as _,
+    App, DefiniteLength, Entity, InteractiveElement as _, IntoElement, ParentElement, RenderOnce,
+    SharedString, StyleRefinement, Styled, Window, prelude::FluentBuilder as _,
 };
 
 use super::{EditorState, Input, MarkdownMode};
@@ -137,7 +137,9 @@ impl RenderOnce for Editor {
                 state.set_display_provider(provider, cx);
             });
         }
-        Input::from_state(self.state.clone())
+        let task_mouse_down = (self.markdown_mode == Some(MarkdownMode::LivePreview))
+            .then(|| super::markdown::task_mouse_down(&self.state, window, cx));
+        let input = Input::from_state(self.state.clone())
             .appearance(self.appearance)
             .bordered(self.bordered)
             .focus_bordered(false)
@@ -145,12 +147,30 @@ impl RenderOnce for Editor {
             .readonly(self.readonly)
             .tab_index(self.tab_index)
             .role(self.role)
-            .when_some(self.height, |this, height| this.h(height))
             .when_some(self.aria_label, |this, label| this.aria_label(label))
             .when_some(self.context_menu_builder, |this, build| {
                 this.context_menu(move |menu, window, cx| build(menu, window, cx))
-            })
+            });
+        let Some(task_mouse_down) = task_mouse_down else {
+            return input
+                .when_some(self.height, |this, height| this.h(height))
+                .refine_style(&self.style)
+                .into_any_element();
+        };
+        // Task checkboxes are glyphs in the text, so their clicks are caught
+        // around the input before it moves the caret. The frame takes the
+        // layout style; the input keeps the text style it would otherwise
+        // override with its own size.
+        let text_style = StyleRefinement {
+            text: self.style.text.clone(),
+            ..Default::default()
+        };
+        gpui::div()
+            .size_full()
+            .when_some(self.height, |this, height| this.h(height))
             .refine_style(&self.style)
+            .capture_any_mouse_down(task_mouse_down)
+            .child(input.size_full().refine_style(&text_style))
             .into_any_element()
     }
 }
