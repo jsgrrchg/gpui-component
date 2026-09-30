@@ -397,6 +397,8 @@ pub struct TextMark {
     pub strikethrough: bool,
     pub underline: bool,
     pub code: bool,
+    /// Invalid math keeps its original source visible in the theme's error color.
+    pub math_error: bool,
     /// Highlight (`<mark>`) the text with this background color.
     ///
     /// `None` means the text is not highlighted.
@@ -447,6 +449,7 @@ impl TextMark {
         self.strikethrough |= other.strikethrough;
         self.underline |= other.underline;
         self.code |= other.code;
+        self.math_error |= other.math_error;
         if other.highlight.is_some() {
             self.highlight = other.highlight;
         }
@@ -480,10 +483,14 @@ pub struct ImageNode {
     pub height: Option<DefiniteLength>,
     /// Preserve wiki embed spelling when copying rendered content as Markdown.
     pub markdown: Option<SharedString>,
+    pub(crate) math: Option<Arc<super::advanced::MathFormula>>,
 }
 
 impl ImageNode {
-    pub(super) fn source(&self, root: Option<&std::path::Path>) -> gpui::ImageSource {
+    pub(super) fn source(&self, root: Option<&std::path::Path>, cx: &App) -> gpui::ImageSource {
+        if let Some(math) = &self.math {
+            return math.image_source(cx);
+        }
         super::utils::local_image_path(&self.url, root).map_or_else(
             || image_source(&self.url),
             |path| gpui::ImageSource::Resource(gpui::Resource::Path(path)),
@@ -507,6 +514,7 @@ impl PartialEq for ImageNode {
             && self.width == other.width
             && self.height == other.height
             && self.markdown == other.markdown
+            && self.math == other.math
     }
 }
 
@@ -1336,6 +1344,11 @@ impl Paragraph {
         let span = self.span;
         let children = &self.children;
         let image_only = children.iter().any(|node| node.image.is_some())
+            && !children.iter().any(|node| {
+                node.image
+                    .as_ref()
+                    .is_some_and(|image| image.math.is_some())
+            })
             && children.iter().all(|node| node.text.trim().is_empty());
 
         if !image_only && self.should_render_inline_flow() {
@@ -1383,7 +1396,7 @@ impl Paragraph {
                 let image_element = if note_embed {
                     super::notes::render_embed(ix, image, node_cx, cx)
                 } else {
-                    img(image.source(node_cx.style.image_root.as_deref()))
+                    img(image.source(node_cx.style.image_root.as_deref(), cx))
                         .id(ix)
                         .object_fit(ObjectFit::Contain)
                         .max_w(relative(1.))
@@ -1472,6 +1485,9 @@ impl Paragraph {
                     if let Some(color) = style.highlight {
                         highlight.background_color = Some(color);
                     }
+                    if style.math_error {
+                        highlight.color = Some(cx.theme().danger);
+                    }
 
                     if let Some(mut link_mark) = style.link.clone() {
                         highlight.color =
@@ -1535,7 +1551,14 @@ impl Paragraph {
         }
         let has_image = self.children.iter().any(|child| child.image.is_some());
         let has_text = self.children.iter().any(|child| !child.text.is_empty());
-        has_image && has_text
+        has_image
+            && (has_text
+                || self.children.iter().any(|child| {
+                    child
+                        .image
+                        .as_ref()
+                        .is_some_and(|image| image.math.is_some())
+                }))
     }
 
     fn inline_flow_items(&self, node_cx: &NodeContext, cx: &mut App) -> Vec<InlineFlowItem> {
@@ -1563,7 +1586,8 @@ impl Paragraph {
                 }
 
                 items.push(InlineFlowItem::Image {
-                    source: image.source(node_cx.style.image_root.as_deref()),
+                    fit_width: image.math.is_some(),
+                    source: image.source(node_cx.style.image_root.as_deref(), cx),
                     link: image.link.clone(),
                     title: image.title(),
                     width: image.width,
@@ -1603,6 +1627,9 @@ impl Paragraph {
                     }
                     if let Some(color) = style.highlight {
                         highlight.background_color = Some(color);
+                    }
+                    if style.math_error {
+                        highlight.color = Some(cx.theme().danger);
                     }
 
                     if let Some(mut link_mark) = style.link.clone() {
@@ -2194,18 +2221,27 @@ impl BlockNode {
                     // Measure the same formatted runs used by the cell, including
                     // header weight, emphasis and links, rather than character counts.
                     for item in cell.children.inline_flow_items(node_cx, cx) {
-                        if let InlineFlowItem::Text {
-                            text, highlights, ..
-                        } = item
-                        {
-                            let text: SharedString = text.replace('\n', " ").into();
-                            let runs = runs_for_highlights(&text, &cell_text_style, highlights);
-                            w += f32::from(
-                                window
-                                    .text_system()
-                                    .shape_line(text, font_size, &runs, None)
-                                    .width(),
-                            );
+                        match item {
+                            InlineFlowItem::Text {
+                                text, highlights, ..
+                            } => {
+                                let text: SharedString = text.replace('\n', " ").into();
+                                let runs = runs_for_highlights(&text, &cell_text_style, highlights);
+                                w += f32::from(
+                                    window
+                                        .text_system()
+                                        .shape_line(text, font_size, &runs, None)
+                                        .width(),
+                                );
+                            }
+                            InlineFlowItem::Image {
+                                fit_width: true,
+                                width: Some(DefiniteLength::Absolute(width)),
+                                ..
+                            } => {
+                                w += f32::from(width.to_pixels(window.rem_size()));
+                            }
+                            _ => {}
                         }
                     }
                 } else {
@@ -2221,6 +2257,14 @@ impl BlockNode {
                             .width;
                         w = w.max(f32::from(line_w));
                     }
+                    w += cell
+                        .children
+                        .children
+                        .iter()
+                        .filter_map(|node| {
+                            node.image.as_ref()?.math.as_ref().map(|math| math.width)
+                        })
+                        .sum::<f32>();
                 }
                 // Border-box widths, so the padding and border the cell draws
                 // must leave the measured text its full width.
@@ -2560,7 +2604,9 @@ impl BlockNode {
                 .into_any_element(),
             BlockNode::CodeBlock(code_block) => code_block.render(&options, node_cx, window, cx),
             BlockNode::Custom(node) => {
-                let inner = match node_cx.markdown_extensions.render_block(node, window, cx) {
+                let inner = match super::advanced::render_block(node, window, cx)
+                    .or_else(|| node_cx.markdown_extensions.render_block(node, window, cx))
+                {
                     Some(rendered) => rendered,
                     None => div().child(node.as_text().to_string()).into_any_element(),
                 };

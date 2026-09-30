@@ -314,7 +314,8 @@ fn replacement(range: Range<usize>, text: impl Into<SharedString>) -> DisplayRep
 impl MarkdownDocument {
     fn parse(source: &str) -> Self {
         let mut document = Self::default();
-        let Ok(root) = crate::text::wiki::parse(source, &markdown::ParseOptions::gfm()) else {
+        let Ok(root) = crate::text::wiki::parse(source, &crate::text::advanced::parse_options())
+        else {
             return document;
         };
         let definitions = root
@@ -357,12 +358,15 @@ impl MarkdownDocument {
                 | Node::Blockquote(_)
                 | Node::ThematicBreak(_)
                 | Node::FootnoteDefinition(_)
+                | Node::Math(_)
         ) || matches!(node, Node::Paragraph(_))
             && node.children().is_some_and(|children| {
                 children
                     .iter()
                     .any(|child| matches!(child, Node::Image(_) | Node::ImageReference(_)))
-            });
+            })
+            || matches!(node, Node::Paragraph(_) | Node::ListItem(_))
+                && crate::text::advanced::contains_inline_math(node);
         if rendered_block {
             let mut tasks = Vec::new();
             collect_tasks(node, source, &mut tasks);
@@ -371,7 +375,9 @@ impl MarkdownDocument {
             for task in &tasks {
                 self.task_glyph(task);
             }
-            let code = if let Node::Code(code) = node {
+            let code = if let Node::Code(code) = node
+                && !crate::text::advanced::is_advanced_fence(code.lang.as_deref())
+            {
                 self.fenced_code_blocks += 1;
                 code_editor::fenced_code(
                     source,

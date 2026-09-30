@@ -161,6 +161,48 @@ title opens its note; clicking its body in Live preview reveals the embed source
 The Editor story includes editable Demo, Viaje, Ideas and empty notes, with
 independent editor states to preserve edits and undo history during navigation.
 
+### Mermaid and LaTeX
+
+Live preview and Preview render fenced `mermaid` diagrams, inline math with
+`$...$`, and display math with `$$` on their own lines. Fences named `math`,
+`latex` or `tex` also render a math expression in display style:
+
+````markdown
+The identity $e^{i\pi} + 1 = 0$ appears inside its paragraph.
+
+$$
+\int_0^\infty e^{-x^2}\,dx = \frac{\sqrt{\pi}}{2}
+$$
+
+```mermaid
+flowchart LR
+    A[Write] --> B{Preview}
+    B --> C[Save]
+```
+````
+
+Rendering uses the native [mermaid-rs-renderer](https://github.com/1jehuang/mermaid-rs-renderer)
+and [RaTeX](https://github.com/erweixin/RaTeX) engines. KaTeX fonts are embedded;
+the application needs no browser, Node.js, TeX installation or rendering service.
+Diagrams and display formulas are centered and shrink proportionally to fit the
+available width. Formula colors and diagram themes follow light/dark mode.
+Renderer results are cached, and the geometry is reserved before image decoding
+to keep the layout stable.
+
+LaTeX support covers math expressions, including fractions, roots, integrals,
+sums and matrices; full TeX documents are not a supported input format.
+Mermaid syntax support follows the native engine and can differ from Mermaid.js.
+Invalid blocks show an error and their source; invalid inline formulas remain
+visible as their original source in the error color. A rendering input is limited
+to 32 KiB. Escaped dollars (`\$`) and formulas inside ordinary code remain literal.
+
+Click a diagram or a display formula in Live preview to reveal its source.
+Paragraphs containing inline formulas reveal their whole paragraph while it is
+being edited, then render again after moving the caret away. Lists with inline
+math render as list items, preserving task checkboxes. The copy action copies
+the original Markdown; source copying also preserves inline math delimiters.
+The same rendering works inside headings, quotes, tables and embedded notes.
+
 Clicking the upper half of a rendered block reveals its source at the start;
 clicking the lower half places the cursor at the end.
 

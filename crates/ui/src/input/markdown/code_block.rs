@@ -60,6 +60,9 @@ impl MarkdownPlugin for CodeBlockPlugin {
         let Node::Code(code) = node else {
             return None;
         };
+        if crate::text::advanced::is_advanced_fence(code.lang.as_deref()) {
+            return None;
+        }
         let lang = code
             .lang
             .as_ref()

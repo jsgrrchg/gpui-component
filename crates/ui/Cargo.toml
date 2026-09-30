@@ -130,6 +130,11 @@ rust_decimal = { version = "1.37.0", optional = true }
 
 # Markdown Parser
 markdown = { version = "1.0.0", features = ["serde"] }
+mermaid-rs-renderer = { version = "0.3.1", default-features = false }
+ratex-parser = "=0.1.14"
+ratex-layout = "=0.1.14"
+ratex-types = "=0.1.14"
+ratex-svg = { version = "=0.1.14", features = ["embed-fonts"] }
 
 # HTML Parser
 html5ever = "0.27"

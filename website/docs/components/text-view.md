@@ -67,6 +67,36 @@ See [Editor](./editor.md#links-and-embeds-between-notes) for a callback example.
 Wiki links use the note navigator; `on_link_click` continues to handle ordinary
 Markdown and HTML links.
 
+### Mermaid and LaTeX math
+
+Markdown TextViews render `mermaid` fences, inline `$...$` math, and display
+`$$...$$` math automatically. `math`, `latex` and `tex` fences accept a math
+expression in display style. The native engines work offline, with bundled
+KaTeX fonts. Math also works inside formatted text, headings, lists, quotes,
+table cells and note embeds.
+
+````rust
+TextView::markdown("advanced", r#"
+Inline: $\frac{a}{b}$.
+
+$$
+\sqrt{x^2 + y^2}
+$$
+
+```mermaid
+flowchart LR
+    A[Markdown] --> B[Preview]
+```
+"#)
+````
+
+Diagrams and display math fit the available width and follow the current theme.
+Source copying and block copy actions keep the original Markdown spelling.
+Errors retain visible source so the input can be corrected. Inputs are limited
+to 32 KiB per formula/diagram. Use `\$` for literal dollar signs, and ordinary
+code fences or inline code when showing formula syntax as text. See
+[Editor](./editor.md#mermaid-and-latex) for supported engines and editing behavior.
+
 ## Link Click Handling
 
 Use `on_link_click` when links should be routed by the application instead of

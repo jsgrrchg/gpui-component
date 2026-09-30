@@ -45,6 +45,61 @@ Las pestañas de notas permiten volver a esta demostración. Cada nota conserva 
 Haz clic en el título de una tarjeta para abrir su nota, o en el contenido para editar el embed.
 Los tokens escapados, como \[[Ideas]], y el código `![[Viaje]]` permanecen literales.
 
+## Fórmulas LaTeX
+
+Las fórmulas se pueden mezclar con texto: $e^{i\pi} + 1 = 0$ y $\frac{a}{b}$.
+Usa `$$` para una fórmula centrada en su propio bloque:
+
+$$
+\int_0^\infty e^{-x^2}\,dx = \frac{\sqrt{\pi}}{2}
+$$
+
+```latex
+\begin{pmatrix}
+1 & 2 \\
+3 & 4
+\end{pmatrix}
+\begin{pmatrix}x\\y\end{pmatrix}
+= \begin{pmatrix}x+2y\\3x+4y\end{pmatrix}
+```
+
+También funcionan dentro de una cita y una tabla:
+
+> La identidad de Pitágoras es $a^2 + b^2 = c^2$.
+
+| Nombre | Fórmula |
+| :--- | :--- |
+| Área del círculo | $A = \pi r^2$ |
+| Suma | $\sum_{k=1}^{n} k = \frac{n(n+1)}{2}$ |
+
+## Diagramas Mermaid
+
+```mermaid
+flowchart LR
+    A[Escribir Markdown] --> B{Contenido}
+    B -->|Texto| C[Live preview]
+    B -->|Fórmula| D[LaTeX]
+    B -->|Diagrama| E[Mermaid]
+    C --> F[Nota lista]
+    D --> F
+    E --> F
+```
+
+```mermaid
+sequenceDiagram
+    participant U as Usuario
+    participant E as Editor
+    participant N as Nota
+    U->>E: Abrir enlace
+    E->>N: Resolver destino
+    N-->>E: Contenido Markdown
+    E-->>U: Mostrar nota
+```
+
+Haz clic en una fórmula o un diagrama para editar su fuente, y mueve el cursor fuera
+del bloque para volver a renderizarlo. La acción de copiar conserva la sintaxis Markdown.
+El código `\frac{a}{b}` y los dólares escapados \$20 permanecen como texto.
+
 ## Images
 
 Images are centered and keep their proportions. Click the image to edit its source,

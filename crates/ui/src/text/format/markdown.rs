@@ -264,10 +264,32 @@ fn parse_paragraph(
             });
         }
         Node::InlineMath(raw) => {
-            text = raw.value.clone();
-            paragraph.push(
-                InlineNode::new(&text).marks(vec![(0..text.len(), TextMark::default().code())]),
-            );
+            let original = raw
+                .position
+                .as_ref()
+                .and_then(|pos| source.get(pos.start.offset..pos.end.offset))
+                .map(str::to_string)
+                .unwrap_or_else(|| format!("${}$", raw.value));
+            match crate::text::advanced::MathFormula::parse(&raw.value, false) {
+                Ok(math) => paragraph.push_image(ImageNode {
+                    width: Some(gpui::px(math.width).into()),
+                    height: Some(gpui::px(math.height).into()),
+                    title: Some(raw.value.clone().into()),
+                    markdown: Some(original.into()),
+                    math: Some(math),
+                    ..Default::default()
+                }),
+                Err(_) => {
+                    text = original;
+                    paragraph.push(InlineNode::new(&text).marks(vec![(
+                        0..text.len(),
+                        TextMark {
+                            math_error: true,
+                            ..Default::default()
+                        },
+                    )]));
+                }
+            }
         }
         Node::MdxTextExpression(raw) => {
             text = raw.value.clone();
@@ -361,6 +383,10 @@ fn ast_to_node(source: &str, value: mdast::Node, cx: &mut NodeContext) -> BlockN
     let span = new_span(value.position().cloned(), cx);
     let parse_cx = MarkdownParseContext::new(source, cx.offset);
     if let Some(mut node) = cx.markdown_extensions.parse_block(&value, &parse_cx) {
+        node.set_span(span);
+        return BlockNode::Custom(node);
+    }
+    if let Some(mut node) = crate::text::advanced::parse_block(&value, &parse_cx) {
         node.set_span(span);
         return BlockNode::Custom(node);
     }

@@ -38,6 +38,8 @@ pub(super) enum InlineFlowItem {
     },
     Image {
         source: ImageSource,
+        /// Scale wide inline formulas proportionally to the available line.
+        fit_width: bool,
         link: Option<LinkMark>,
         title: String,
         width: Option<DefiniteLength>,
@@ -82,6 +84,7 @@ enum MeasureItem {
     },
     Image {
         source: ImageSource,
+        fit_width: bool,
         width: Option<DefiniteLength>,
         height: Option<DefiniteLength>,
     },
@@ -201,6 +204,7 @@ impl Element for InlineFlow {
                     source,
                     width,
                     height,
+                    ..
                 } => Some(measure_image_size(
                     ix,
                     source,
@@ -379,11 +383,13 @@ impl From<&InlineFlowItem> for MeasureItem {
                 source,
                 width,
                 height,
+                fit_width,
                 ..
             } => MeasureItem::Image {
                 source: source.clone(),
                 width: *width,
                 height: *height,
+                fit_width: *fit_width,
             },
         }
     }
@@ -412,6 +418,29 @@ fn layout_flow(
         return InlineFlowLayout::default();
     }
 
+    let fitted_images: Vec<_> = image_sizes
+        .iter()
+        .enumerate()
+        .map(|(ix, image)| {
+            image.map(|image| {
+                if matches!(
+                    items[ix],
+                    MeasureItem::Image {
+                        fit_width: true,
+                        ..
+                    }
+                ) && let Some(width) = wrap_width
+                    && image.width > width.max(px(1.))
+                {
+                    let scale = width.max(px(1.)) / image.width;
+                    size(image.width * scale, image.height * scale)
+                } else {
+                    image
+                }
+            })
+        })
+        .collect();
+    let image_sizes = fitted_images.as_slice();
     let line_ranges = line_ranges(items, image_sizes, text_style, wrap_width, window);
     let font_size = text_style.font_size.to_pixels(rem_size);
     let mut fragments = Vec::new();

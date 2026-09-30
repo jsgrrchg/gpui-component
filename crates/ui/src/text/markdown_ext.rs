@@ -263,7 +263,7 @@ impl MarkdownExtensions {
     }
 
     pub(crate) fn parse_options(&self) -> ParseOptions {
-        let mut options = ParseOptions::gfm();
+        let mut options = super::advanced::parse_options();
         if self.enable_mdx {
             options.constructs.html_flow = false;
             options.constructs.html_text = false;
