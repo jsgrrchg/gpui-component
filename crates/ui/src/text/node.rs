@@ -368,6 +368,26 @@ pub struct LinkMark {
     /// Optional identifier for footnotes.
     pub identifier: Option<SharedString>,
     pub title: Option<SharedString>,
+    /// Preserve wiki link spelling when reconstructing Markdown.
+    pub markdown: Option<SharedString>,
+}
+
+impl LinkMark {
+    fn to_markdown(&self, text: &str) -> String {
+        if let Some(raw) = &self.markdown
+            && let Some(wiki) = super::wiki::WikiLink::parse(raw)
+        {
+            return if wiki.label == text {
+                raw.to_string()
+            } else {
+                format!("[[{}|{}]]", wiki.target, text)
+            };
+        }
+        match &self.title {
+            Some(title) => format!("[{}]({} \"{}\")", text, self.url, title),
+            None => format!("[{}]({})", text, self.url),
+        }
+    }
 }
 
 #[derive(Debug, Default, Clone, PartialEq)]
@@ -540,10 +560,7 @@ pub(crate) fn wrap_with_mark(text: &str, mark: &TextMark) -> String {
         out = format!("=={}==", out);
     }
     if let Some(link) = &mark.link {
-        out = match &link.title {
-            Some(title) => format!("[{}]({} \"{}\")", out, link.url, title),
-            None => format!("[{}]({})", out, link.url),
-        };
+        out = link.to_markdown(&out);
     }
     out
 }
@@ -1362,47 +1379,52 @@ impl Paragraph {
                     );
                 }
                 let link_click_handler = node_cx.link_click_handler.clone();
-                let image_element = img(image.source(node_cx.style.image_root.as_deref()))
-                    .id(ix)
-                    .object_fit(ObjectFit::Contain)
-                    .max_w(relative(1.))
-                    .when(image_only, |this| this.max_h(px(500.)).rounded(px(6.)))
-                    .when_some(image.width, |this, width| this.w(width))
-                    .when_some(image.height, |this, height| this.h(height))
-                    .when_some(image.link.clone(), |this, link| {
-                        let title = image.title();
-                        let link_click_handler = link_click_handler.clone();
-                        let aux_link = link.clone();
-                        let aux_link_click_handler = link_click_handler.clone();
-                        this.cursor_pointer()
-                            .tooltip(move |window, cx| {
-                                Tooltip::new(title.clone()).build(window, cx)
-                            })
-                            .on_click(move |event, window, cx| {
-                                gpui_base::TextSelection::end(window, cx);
-                                cx.stop_propagation();
-                                handle_link_click(
-                                    &link_click_handler,
-                                    link.url.clone(),
-                                    event.clone(),
-                                    window,
-                                    cx,
-                                );
-                            })
-                            .on_aux_click(move |event, window, cx| {
-                                gpui_base::TextSelection::end(window, cx);
-                                cx.stop_propagation();
-                                handle_link_click(
-                                    &aux_link_click_handler,
-                                    aux_link.url.clone(),
-                                    event.clone(),
-                                    window,
-                                    cx,
-                                );
-                            })
-                    })
-                    .into_any_element();
-                child_nodes.push(if image_only {
+                let note_embed = super::wiki::note_target(&image.url).is_some();
+                let image_element = if note_embed {
+                    super::notes::render_embed(ix, image, node_cx, cx)
+                } else {
+                    img(image.source(node_cx.style.image_root.as_deref()))
+                        .id(ix)
+                        .object_fit(ObjectFit::Contain)
+                        .max_w(relative(1.))
+                        .when(image_only, |this| this.max_h(px(500.)).rounded(px(6.)))
+                        .when_some(image.width, |this, width| this.w(width))
+                        .when_some(image.height, |this, height| this.h(height))
+                        .when_some(image.link.clone(), |this, link| {
+                            let title = image.title();
+                            let link_click_handler = link_click_handler.clone();
+                            let aux_link = link.clone();
+                            let aux_link_click_handler = link_click_handler.clone();
+                            this.cursor_pointer()
+                                .tooltip(move |window, cx| {
+                                    Tooltip::new(title.clone()).build(window, cx)
+                                })
+                                .on_click(move |event, window, cx| {
+                                    gpui_base::TextSelection::end(window, cx);
+                                    cx.stop_propagation();
+                                    handle_link_click(
+                                        &link_click_handler,
+                                        link.url.clone(),
+                                        event.clone(),
+                                        window,
+                                        cx,
+                                    );
+                                })
+                                .on_aux_click(move |event, window, cx| {
+                                    gpui_base::TextSelection::end(window, cx);
+                                    cx.stop_propagation();
+                                    handle_link_click(
+                                        &aux_link_click_handler,
+                                        aux_link.url.clone(),
+                                        event.clone(),
+                                        window,
+                                        cx,
+                                    );
+                                })
+                        })
+                        .into_any_element()
+                };
+                child_nodes.push(if image_only && !note_embed {
                     // NeverWrite centers block images with 8px vertical spacing.
                     div()
                         .w_full()
@@ -1452,7 +1474,8 @@ impl Paragraph {
                     }
 
                     if let Some(mut link_mark) = style.link.clone() {
-                        highlight.color = Some(cx.theme().link);
+                        highlight.color =
+                            Some(super::notes::link_color(&link_mark.url, &node_cx.style, cx));
                         highlight.underline = Some(gpui::UnderlineStyle {
                             thickness: gpui::px(1.),
                             ..Default::default()
@@ -1502,6 +1525,14 @@ impl Paragraph {
     }
 
     fn should_render_inline_flow(&self) -> bool {
+        if self.children.iter().any(|child| {
+            child
+                .image
+                .as_ref()
+                .is_some_and(|image| super::wiki::note_target(&image.url).is_some())
+        }) {
+            return false;
+        }
         let has_image = self.children.iter().any(|child| child.image.is_some());
         let has_text = self.children.iter().any(|child| !child.text.is_empty());
         has_image && has_text
@@ -1575,7 +1606,8 @@ impl Paragraph {
                     }
 
                     if let Some(mut link_mark) = style.link.clone() {
-                        highlight.color = Some(cx.theme().link);
+                        highlight.color =
+                            Some(super::notes::link_color(&link_mark.url, &node_cx.style, cx));
                         highlight.underline = Some(gpui::UnderlineStyle {
                             thickness: gpui::px(1.),
                             ..Default::default()
@@ -1638,7 +1670,7 @@ impl Paragraph {
                         text = format!("=={}==", &text_node.text[range.clone()]);
                     }
                     if let Some(link) = &style.link {
-                        text = format!("[{}]({})", &text_node.text[range.clone()], link.url);
+                        text = link.to_markdown(&text_node.text[range.clone()]);
                     }
                 }
 

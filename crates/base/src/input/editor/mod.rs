@@ -91,10 +91,19 @@ impl InputModeKind for EditorMode {
     ) -> bool {
         if event.modifiers.secondary()
             && let Some(provider) = &state.extras.display_provider
-            && let Some(url) = provider.borrow().link_at(offset)
         {
-            cx.open_url(&url);
-            return true;
+            let (url, handler) = {
+                let provider = provider.borrow();
+                (provider.link_at(offset), provider.link_handler())
+            };
+            if let Some(url) = url {
+                if let Some(handler) = handler {
+                    window.defer(cx, move |window, cx| handler(&url, window, cx));
+                } else {
+                    cx.open_url(&url);
+                }
+                return true;
+            }
         }
         state.handle_click_hover_definition(event, offset, window, cx)
     }

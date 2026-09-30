@@ -44,6 +44,29 @@ TextView::markdown("preview", markdown_source)
 TextView::html("html-preview", "<strong>Hello</strong>")
 ```
 
+### Wiki note links and embeds
+
+Configure the same application-owned `MarkdownNotes` callbacks used by Editor:
+
+```rust
+use gpui_component::text::{TextView, TextViewStyle};
+
+TextView::markdown("note", "See [[Welcome|the introduction]].\n\n![[Welcome]]")
+    .style(TextViewStyle::default().notes(notes.clone()))
+```
+
+`[[note]]` links navigate on click; `![[note]]` renders a card with a clickable
+title and Markdown content. Missing notes are marked, empty notes have a
+placeholder, and recursive embeds stop at repeated canonical ids or four levels.
+Image embeds such as `![[/assets/photo.png|400]]` retain their image behavior.
+Escaped tokens and code stay literal. Source copying preserves wiki syntax.
+Keep callbacks stable between renders and use `notes.refreshed()` after external
+note changes. The resolver should use an in-memory index, with canonical ids
+shared by every alias of a note; loading and persistence belong to the host.
+See [Editor](./editor.md#links-and-embeds-between-notes) for a callback example.
+Wiki links use the note navigator; `on_link_click` continues to handle ordinary
+Markdown and HTML links.
+
 ## Link Click Handling
 
 Use `on_link_click` when links should be routed by the application instead of

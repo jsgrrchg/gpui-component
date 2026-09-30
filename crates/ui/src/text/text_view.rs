@@ -24,6 +24,16 @@ pub(crate) type LinkClickHandlerFn =
 
 pub(crate) type TaskToggleHandlerFn = dyn Fn(usize, bool, &mut Window, &mut App) + Send + Sync;
 
+fn is_navigation_click(event: &ClickEvent) -> bool {
+    match event {
+        ClickEvent::Mouse(click) => {
+            matches!(click.up.button, MouseButton::Left | MouseButton::Middle)
+        }
+        ClickEvent::Keyboard(_) => true,
+        ClickEvent::Touch(click) => !click.long_press,
+    }
+}
+
 pub(crate) fn handle_link_click(
     handler: &Option<Arc<LinkClickHandlerFn>>,
     url: SharedString,
@@ -33,13 +43,7 @@ pub(crate) fn handle_link_click(
 ) {
     if let Some(handler) = handler {
         handler(&url, &event, window, cx);
-    } else if match &event {
-        ClickEvent::Mouse(click) => {
-            matches!(click.up.button, MouseButton::Left | MouseButton::Middle)
-        }
-        ClickEvent::Keyboard(_) => true,
-        ClickEvent::Touch(click) => !click.long_press,
-    } {
+    } else if is_navigation_click(&event) {
         cx.open_url(&url);
     }
 }
@@ -356,7 +360,21 @@ impl Element for TextView {
 
         state.update(cx, |state, cx| {
             state.code_block_actions = self.code_block_actions.clone();
-            state.link_click_handler = self.link_click_handler.clone();
+            let notes = self.text_view_style.notes.clone();
+            let original_handler = self.link_click_handler.clone();
+            // Internal note targets are never handed to the OS URL opener,
+            // including when the application has no resolver configured.
+            state.link_click_handler = Some(Arc::new(move |url, event, window, cx| {
+                if let Some(target) = super::wiki::note_target(url) {
+                    if is_navigation_click(event)
+                        && let Some(notes) = &notes
+                    {
+                        notes.navigate(target, window, cx);
+                    }
+                } else {
+                    handle_link_click(&original_handler, url.clone(), event.clone(), window, cx);
+                }
+            }));
             state.task_toggle_handler = self.task_toggle_handler.clone();
             state.task_list_readonly = self.task_list_readonly;
             state.set_markdown_extensions(self.markdown_extensions.clone(), cx);

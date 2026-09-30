@@ -42,6 +42,12 @@ pub trait EditorDisplayProvider {
         None
     }
 
+    /// Optional application navigation. Invoked after the input event releases
+    /// its editor borrow, allowing the handler to replace the active document.
+    fn link_handler(&self) -> Option<Rc<dyn Fn(&SharedString, &mut Window, &mut App)>> {
+        None
+    }
+
     fn display(
         &mut self,
         text: &Rope,

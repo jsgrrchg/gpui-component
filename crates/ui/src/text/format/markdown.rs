@@ -15,7 +15,7 @@ use crate::text::{
 /// Parse Markdown into a tree of nodes.
 pub(crate) fn parse(source: &str, cx: &mut NodeContext) -> Result<ParsedDocument, SharedString> {
     let options = cx.markdown_extensions.parse_options();
-    crate::text::wiki_image::parse(source, &options)
+    crate::text::wiki::parse(source, &options)
         .map(|n| ast_to_document(source, n, cx))
         .map_err(|e| e.to_string().into())
 }
@@ -223,6 +223,12 @@ fn parse_paragraph(
             let link_mark = Some(LinkMark {
                 url: val.url.clone().into(),
                 title: val.title.clone().map(|s| s.into()),
+                markdown: val
+                    .position
+                    .as_ref()
+                    .and_then(|pos| source.get(pos.start.offset..pos.end.offset))
+                    .filter(|raw| crate::text::wiki::WikiLink::parse(raw).is_some())
+                    .map(|raw| raw.to_string().into()),
                 ..Default::default()
             });
 
@@ -242,7 +248,7 @@ fn parse_paragraph(
                 .position
                 .as_ref()
                 .and_then(|pos| source.get(pos.start.offset..pos.end.offset));
-            let wiki = original.and_then(crate::text::wiki_image::WikiImage::parse);
+            let wiki = original.and_then(crate::text::wiki::WikiImage::parse);
             paragraph.push_image(ImageNode {
                 url: raw.url.clone().into(),
                 title: raw.title.clone().map(|t| t.into()),
@@ -251,7 +257,9 @@ fn parse_paragraph(
                     .as_ref()
                     .and_then(|image| image.width)
                     .map(|width| gpui::px(width as f32).into()),
-                markdown: wiki.map(|_| original.unwrap().to_string().into()),
+                markdown: original
+                    .filter(|raw| crate::text::wiki::WikiLink::parse(raw).is_some())
+                    .map(|raw| raw.to_string().into()),
                 ..Default::default()
             });
         }
@@ -299,6 +307,7 @@ fn parse_paragraph(
                 url: "".into(),
                 title: link.label.clone().map(Into::into),
                 identifier: Some(link.identifier.clone().into()),
+                ..Default::default()
             };
 
             text = merge_children_with_mark(
@@ -516,6 +525,7 @@ fn ast_to_node(source: &str, value: mdast::Node, cx: &mut NodeContext) -> BlockN
                     url: def.url.clone().into(),
                     identifier: Some(def.identifier.clone().into()),
                     title: def.title.clone().map(Into::into),
+                    ..Default::default()
                 },
             );
 

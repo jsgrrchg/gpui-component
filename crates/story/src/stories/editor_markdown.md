@@ -30,6 +30,21 @@ let editor = cx.new(|cx| {
 Editor::new(&editor).markdown_mode(MarkdownMode::LivePreview)
 ```
 
+## Enlaces entre notas
+
+Visita [[Viaje]], [[Ideas.md|ideas para el viaje]] o [[No existe|una nota pendiente]].
+En Live preview, usa Ctrl+clic (Cmd+clic en macOS) para navegar; en el panel Preview basta un clic.
+Las pestañas de notas permiten volver a esta demostración. Cada nota conserva sus ediciones y su historial.
+
+![[Viaje]]
+
+![[Vacia]]
+
+![[No existe]]
+
+Haz clic en el título de una tarjeta para abrir su nota, o en el contenido para editar el embed.
+Los tokens escapados, como \[[Ideas]], y el código `![[Viaje]]` permanecen literales.
+
 ## Images
 
 Images are centered and keep their proportions. Click the image to edit its source,

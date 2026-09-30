@@ -4,19 +4,21 @@ mod inline;
 mod inline_flow;
 mod markdown_ext;
 mod node;
+mod notes;
 pub(crate) mod selection;
 mod selection_adapter;
 mod state;
 mod style;
 mod text_view;
 mod utils;
-pub(crate) mod wiki_image;
+pub(crate) mod wiki;
 #[cfg(test)]
 mod window_selection;
 
 use gpui::{App, ElementId, IntoElement, RenderOnce, SharedString, Window};
 pub use markdown_ext::*;
 pub(crate) use node::{CodeBlock, Span};
+pub use notes::{MarkdownNote, MarkdownNotes};
 pub use state::*;
 pub use style::*;
 pub use text_view::*;

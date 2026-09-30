@@ -1,9 +1,21 @@
-use gpui::{
-    App, AppContext as _, Context, Entity, HighlightStyle, IntoElement, ParentElement, Render,
-    Styled, Window, div,
+use std::{
+    collections::HashMap,
+    sync::{Arc, RwLock},
 };
 
-use gpui_component::{ActiveTheme, h_flex, input::*, switch::Switch, tab::TabBar, v_flex};
+use gpui::{
+    App, AppContext as _, Context, Entity, HighlightStyle, IntoElement, ParentElement, Render,
+    Styled, Subscription, Window, div,
+};
+
+use gpui_component::{
+    ActiveTheme, h_flex,
+    input::*,
+    switch::Switch,
+    tab::TabBar,
+    text::{MarkdownNote, MarkdownNotes},
+    v_flex,
+};
 
 const EXAMPLE_CODE: &str = include_str!("./editor_preview.rs");
 const EXAMPLE_MARKDOWN: &str = include_str!("./editor_markdown.md");
@@ -13,6 +25,10 @@ pub struct EditorStory {
     decorations_state: Entity<EditorState>,
     markdown_state: Entity<EditorState>,
     markdown_mode: MarkdownMode,
+    markdown_notes: MarkdownNotes,
+    note_states: HashMap<String, Entity<EditorState>>,
+    current_note: String,
+    _note_subscriptions: Vec<Subscription>,
     preview_pane: bool,
     _decorations: TextDecorationCollection,
     active_tab: usize,
@@ -77,6 +93,84 @@ impl EditorStory {
                 .folding(false)
                 .default_value(EXAMPLE_MARKDOWN)
         });
+        // Each note owns its editor state, so navigation preserves unsaved edits,
+        // cursor positions, scroll positions and undo history.
+        let note_sources = [
+            ("Demo", EXAMPLE_MARKDOWN),
+            ("Viaje", include_str!("./editor_assets/notes/viaje.md")),
+            ("Ideas", include_str!("./editor_assets/notes/ideas.md")),
+            ("Vacia", ""),
+        ];
+        let index = Arc::new(RwLock::new(
+            note_sources
+                .iter()
+                .map(|(id, source)| {
+                    (
+                        id.to_lowercase(),
+                        MarkdownNote {
+                            id: id.to_string().into(),
+                            title: id.to_string().into(),
+                            markdown: source.to_string().into(),
+                        },
+                    )
+                })
+                .collect::<HashMap<_, _>>(),
+        ));
+        let resolver_index = index.clone();
+        let story = cx.entity().downgrade();
+        let markdown_notes = MarkdownNotes::new(
+            move |target| {
+                let key = target
+                    .trim()
+                    .trim_start_matches('/')
+                    .trim_end_matches(".md")
+                    .to_lowercase();
+                resolver_index.read().ok()?.get(&key).cloned()
+            },
+            move |note, window, cx| {
+                _ = story.update(cx, |story, cx| {
+                    if let Some(state) = story.note_states.get(note.id.as_ref()) {
+                        story.markdown_state = state.clone();
+                        story.current_note = note.id.to_string();
+                        story
+                            .markdown_state
+                            .update(cx, |state, cx| state.focus(window, cx));
+                        cx.notify();
+                    }
+                });
+            },
+        );
+        let mut note_states = HashMap::new();
+        let mut note_subscriptions = Vec::new();
+        for (id, source) in note_sources {
+            let state = if id == "Demo" {
+                markdown_state.clone()
+            } else {
+                cx.new(|cx| {
+                    EditorState::new(window, cx)
+                        .language("markdown")
+                        .line_number(false)
+                        .folding(false)
+                        .default_value(source)
+                })
+            };
+            let index = index.clone();
+            note_subscriptions.push(cx.subscribe(
+                &state,
+                move |story, state, event: &InputEvent, cx| {
+                    if matches!(event, InputEvent::Change) {
+                        if let Ok(mut notes) = index.write()
+                            && let Some(note) = notes.get_mut(&id.to_lowercase())
+                        {
+                            note.markdown = state.read(cx).value();
+                        }
+                        story.markdown_notes = story.markdown_notes.refreshed();
+                        cx.notify();
+                    }
+                },
+            ));
+            note_states.insert(id.to_string(), state);
+        }
         let decorations_state = cx.new(|cx| {
             EditorState::new(window, cx)
                 .language("text")
@@ -141,6 +235,10 @@ impl EditorStory {
             decorations_state,
             markdown_state,
             markdown_mode: MarkdownMode::LivePreview,
+            markdown_notes,
+            note_states,
+            current_note: "Demo".to_string(),
+            _note_subscriptions: note_subscriptions,
             preview_pane: false,
             _decorations: decorations,
             active_tab: 2,
@@ -211,6 +309,26 @@ impl Render for EditorStory {
                             })),
                     )
             }))
+            .children((self.active_tab == 2).then(|| {
+                TabBar::new("markdown-demo-notes")
+                    .selected_index(
+                        ["Demo", "Viaje", "Ideas", "Vacia"]
+                            .iter()
+                            .position(|id| *id == self.current_note)
+                            .unwrap_or(0),
+                    )
+                    .on_click(cx.listener(|this, index: &usize, _, cx| {
+                        if let Some(id) = ["Demo", "Viaje", "Ideas", "Vacia"].get(*index) {
+                            this.markdown_state = this.note_states[*id].clone();
+                            this.current_note = id.to_string();
+                            cx.notify();
+                        }
+                    }))
+                    .child("Demo")
+                    .child("Viaje")
+                    .child("Ideas")
+                    .child("Vacía")
+            }))
             .child(div().min_h_0().flex_1().child(if self.active_tab == 0 {
                 Editor::new(&self.editor_state)
                     .font_family(cx.theme().mono_font_family.clone())
@@ -233,6 +351,7 @@ impl Render for EditorStory {
                         div().flex_1().min_w_0().h_full().child(
                             Editor::new(&self.markdown_state)
                                 .markdown_mode(self.markdown_mode)
+                                .markdown_notes(self.markdown_notes.clone())
                                 .markdown_image_root(concat!(
                                     env!("CARGO_MANIFEST_DIR"),
                                     "/src/stories/editor_assets"
@@ -245,6 +364,7 @@ impl Render for EditorStory {
                         div().flex_1().min_w_0().h_full().child(
                             Editor::new(&self.markdown_state)
                                 .markdown_mode(MarkdownMode::Preview)
+                                .markdown_notes(self.markdown_notes.clone())
                                 .markdown_image_root(concat!(
                                     env!("CARGO_MANIFEST_DIR"),
                                     "/src/stories/editor_assets"

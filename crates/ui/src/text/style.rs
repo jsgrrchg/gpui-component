@@ -52,6 +52,8 @@ pub struct TextViewStyle {
     /// Explicit root for local Markdown images. `/assets/a.png` is relative
     /// to this root; relative paths also start here. Default: URI images only.
     pub image_root: Option<PathBuf>,
+    /// Resolve and navigate wiki note links and render note embeds.
+    pub notes: Option<super::MarkdownNotes>,
     /// The highlight style for inline code.
     ///
     /// Default is [`HighlightStyle::default()`], the `background_color` will
@@ -78,6 +80,7 @@ impl PartialEq for TextViewStyle {
             && self.table_cell == other.table_cell
             && self.table_appearance == other.table_appearance
             && self.image_root == other.image_root
+            && self.notes == other.notes
             && self.inline_code == other.inline_code
             && self.is_dark == other.is_dark
     }
@@ -95,6 +98,7 @@ impl Default for TextViewStyle {
             table_cell: StyleRefinement::default(),
             table_appearance: TableAppearance::default(),
             image_root: None,
+            notes: None,
             inline_code: HighlightStyle::default(),
             is_dark: false,
         }
@@ -102,6 +106,10 @@ impl Default for TextViewStyle {
 }
 
 impl TextViewStyle {
+    pub fn notes(mut self, notes: super::MarkdownNotes) -> Self {
+        self.notes = Some(notes);
+        self
+    }
     /// Resolve local Markdown image paths inside an application-owned root.
     pub fn image_root(mut self, root: impl Into<PathBuf>) -> Self {
         self.image_root = Some(root.into());

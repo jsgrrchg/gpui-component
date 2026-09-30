@@ -21,6 +21,7 @@ pub struct Editor {
     readonly: bool,
     markdown_mode: Option<MarkdownMode>,
     markdown_image_root: Option<PathBuf>,
+    markdown_notes: Option<crate::text::MarkdownNotes>,
     tab_index: isize,
     role: RoleOverride,
     aria_label: Option<SharedString>,
@@ -43,6 +44,7 @@ impl Editor {
             readonly: false,
             markdown_mode: None,
             markdown_image_root: None,
+            markdown_notes: None,
             tab_index: 0,
             role: RoleOverride::default(),
             aria_label: None,
@@ -100,6 +102,13 @@ impl Editor {
         self
     }
 
+    /// Resolve `[[note]]` links and `![[note]]` embeds through the application's
+    /// note index. Other Markdown views of this state inherit these callbacks.
+    pub fn markdown_notes(mut self, notes: crate::text::MarkdownNotes) -> Self {
+        self.markdown_notes = Some(notes);
+        self
+    }
+
     pub fn role(mut self, role: impl Into<RoleOverride>) -> Self {
         self.role = role.into();
         self
@@ -132,6 +141,9 @@ impl Styled for Editor {
 impl RenderOnce for Editor {
     fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
         if let Some(mode) = self.markdown_mode {
+            if let Some(notes) = self.markdown_notes {
+                super::markdown::set_notes(&self.state, notes, window, cx);
+            }
             if let Some(root) = self.markdown_image_root {
                 super::markdown::set_image_root(&self.state, Some(root), window, cx);
             }

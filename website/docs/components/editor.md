@@ -114,6 +114,53 @@ During mouse selection, the live preview keeps its current formatting and
 layout. The selected Markdown source is revealed when the left button is
 released, including when released outside the editor.
 
+### Links and embeds between notes
+
+Both preview modes support `[[note]]`, `[[note|Label]]`, and `![[note]]`.
+Image extensions in `![[...]]` keep the image behavior described above.
+Notes render in a framed card with a clickable title and Markdown content;
+long content scrolls inside the card. Missing and empty notes have visible
+states, and recursive embeds stop at repeated canonical ids or four levels.
+Escaped tokens and tokens in code stay literal. Alias separators also accept
+the GFM table spelling `\|`.
+
+The component asks the application to resolve each target and navigate:
+
+```rust
+use gpui_component::text::{MarkdownNote, MarkdownNotes};
+
+let notes = MarkdownNotes::new(
+    |target| {
+        (target == "Welcome").then(|| MarkdownNote {
+            id: "welcome.md".into(),
+            title: "Welcome".into(),
+            markdown: "# Welcome\n\nA linked note.".into(),
+        })
+    },
+    |note, window, cx| {
+        // Open note.id in the application's note editor.
+    },
+);
+
+Editor::new(&state)
+    .markdown_mode(MarkdownMode::LivePreview)
+    .markdown_notes(notes.clone())
+```
+
+Use an in-memory index/cache for resolution. The application decides how names,
+paths, extensions and aliases map to canonical ids, loads Markdown, and opens
+notes. Navigation callbacks run after the input event releases its editor borrow.
+No disk writes or note creation happen inside the component. Keep the
+`MarkdownNotes` value between renders; assign `notes = notes.refreshed()` and
+notify the owning view after changing the index or another note's contents.
+Markdown views of the same editor state inherit the configured callbacks.
+
+In Live preview, Ctrl-click (Cmd-click on macOS) follows an inline link or a
+link inside a rendered block. In Preview, use a regular click. Clicking an embed
+title opens its note; clicking its body in Live preview reveals the embed source.
+The Editor story includes editable Demo, Viaje, Ideas and empty notes, with
+independent editor states to preserve edits and undo history during navigation.
+
 Clicking the upper half of a rendered block reveals its source at the start;
 clicking the lower half places the cursor at the end.
 

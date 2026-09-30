@@ -21,7 +21,7 @@ use markdown::mdast::Node;
 use super::EditorState;
 use crate::{
     ActiveTheme, IconName, IconNamed as _,
-    text::{TableAppearance, TextView, TextViewStyle},
+    text::{MarkdownNotes, TableAppearance, TextView, TextViewStyle},
 };
 
 mod code_block;
@@ -39,12 +39,17 @@ pub enum MarkdownMode {
     LivePreview,
 }
 
-fn markdown_style(cx: &App, image_root: &Option<PathBuf>) -> TextViewStyle {
+fn markdown_style(
+    cx: &App,
+    image_root: &Option<PathBuf>,
+    notes: &Option<MarkdownNotes>,
+) -> TextViewStyle {
     TextViewStyle {
         highlight_theme: cx.theme().highlight_theme.clone(),
         is_dark: cx.theme().is_dark(),
         table_appearance: TableAppearance::Plain,
         image_root: image_root.clone(),
+        notes: notes.clone(),
         ..Default::default()
     }
 }
@@ -52,6 +57,7 @@ fn markdown_style(cx: &App, image_root: &Option<PathBuf>) -> TextViewStyle {
 pub(super) struct MarkdownReadingPreview {
     state: Entity<EditorState>,
     _subscription: Subscription,
+    _observation: Subscription,
 }
 
 pub(super) fn reading_preview(
@@ -70,6 +76,7 @@ pub(super) fn reading_preview(
                 }
             });
             MarkdownReadingPreview {
+                _observation: cx.observe(&state, |_, _, cx| cx.notify()),
                 state,
                 _subscription: subscription,
             }
@@ -79,15 +86,16 @@ pub(super) fn reading_preview(
 
 impl Render for MarkdownReadingPreview {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let image_root = display_state(&self.state, window, cx)
-            .borrow()
-            .image_root
-            .clone();
+        let display = display_state(&self.state, window, cx);
+        let (image_root, notes) = {
+            let display = display.borrow();
+            (display.image_root.clone(), display.notes.clone())
+        };
         TextView::markdown(
             SharedString::from(format!("markdown-preview-{:?}", self.state.entity_id())),
             self.state.read(cx).value(),
         )
-        .style(markdown_style(cx, &image_root))
+        .style(markdown_style(cx, &image_root, &notes))
         .markdown_extensions(code_block::extensions())
         .selectable(true)
         .scrollable(true)
@@ -306,8 +314,7 @@ fn replacement(range: Range<usize>, text: impl Into<SharedString>) -> DisplayRep
 impl MarkdownDocument {
     fn parse(source: &str) -> Self {
         let mut document = Self::default();
-        let Ok(root) = crate::text::wiki_image::parse(source, &markdown::ParseOptions::gfm())
-        else {
+        let Ok(root) = crate::text::wiki::parse(source, &markdown::ParseOptions::gfm()) else {
             return document;
         };
         let definitions = root
@@ -456,7 +463,14 @@ impl MarkdownDocument {
                     replacements,
                 });
             }
-            Node::Link(link) => self.links.push((range.clone(), link.url.clone().into())),
+            Node::Link(link) => {
+                self.links.push((range.clone(), link.url.clone().into()));
+                // The synthetic label copies literal source; do not apply the
+                // ordinary text-node highlight/escape rules inside a wiki name.
+                if crate::text::wiki::WikiLink::parse(&source[range.clone()]).is_some() {
+                    return;
+                }
+            }
             Node::LinkReference(link) => {
                 if let Some(url) = definitions.get(&link.identifier) {
                     self.links.push((range.clone(), url.clone().into()));
@@ -559,6 +573,7 @@ struct MarkdownDisplay {
     /// Tasks whose checkbox glyph is currently shown.
     task_glyphs: Vec<Task>,
     image_root: Option<PathBuf>,
+    notes: Option<MarkdownNotes>,
 }
 
 fn display_state(
@@ -577,6 +592,7 @@ fn display_state(
                 code_focus: Rc::default(),
                 task_glyphs: Vec::new(),
                 image_root: None,
+                notes: None,
             }))
         })
         .read(cx)
@@ -601,6 +617,24 @@ pub(super) fn set_image_root(
     let mut display = display.borrow_mut();
     if display.image_root != image_root {
         display.image_root = image_root;
+        display.last_display = None;
+        for block in &mut display.document.blocks {
+            block.cache = Rc::default();
+        }
+        state.update(cx, |_, cx| cx.notify());
+    }
+}
+
+pub(super) fn set_notes(
+    state: &Entity<EditorState>,
+    notes: MarkdownNotes,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let display = display_state(state, window, cx);
+    let mut display = display.borrow_mut();
+    if display.notes.as_ref() != Some(&notes) {
+        display.notes = Some(notes);
         display.last_display = None;
         for block in &mut display.document.blocks {
             block.cache = Rc::default();
@@ -702,6 +736,18 @@ pub(super) fn task_mouse_down(
 }
 
 impl EditorDisplayProvider for MarkdownDisplay {
+    fn link_handler(&self) -> Option<Rc<dyn Fn(&SharedString, &mut Window, &mut App)>> {
+        let notes = self.notes.clone();
+        Some(Rc::new(move |url, window, cx| {
+            if let Some(target) = crate::text::wiki::note_target(url) {
+                if let Some(notes) = &notes {
+                    notes.navigate(target, window, cx);
+                }
+            } else {
+                cx.open_url(url);
+            }
+        }))
+    }
     fn link_at(&self, offset: usize) -> Option<SharedString> {
         self.document
             .links
@@ -758,6 +804,12 @@ impl EditorDisplayProvider for MarkdownDisplay {
             replacements: self.document.replacements(&selection, focused),
             ..Default::default()
         };
+        let urls: HashMap<_, _> = self
+            .document
+            .links
+            .iter()
+            .map(|(range, url)| (range.start, url))
+            .collect();
         for markup in &self.document.markup {
             let Some(mark) = markup.mark else {
                 continue;
@@ -783,7 +835,22 @@ impl EditorDisplayProvider for MarkdownDisplay {
                     ..Default::default()
                 },
                 Mark::Link => HighlightStyle {
-                    color: Some(cx.theme().primary),
+                    color: Some(
+                        if urls
+                            .get(&markup.range.start)
+                            .and_then(|url| crate::text::wiki::note_target(url))
+                            .is_some_and(|target| {
+                                !self
+                                    .notes
+                                    .as_ref()
+                                    .is_some_and(|notes| notes.resolve(target).is_some())
+                            })
+                        {
+                            cx.theme().danger
+                        } else {
+                            cx.theme().primary
+                        },
+                    ),
                     underline: Some(gpui::UnderlineStyle {
                         thickness: px(1.),
                         color: None,
@@ -829,6 +896,7 @@ impl EditorDisplayProvider for MarkdownDisplay {
             }
             let source = block.source.clone();
             let image_root = self.image_root.clone();
+            let notes = self.notes.clone();
             let state = self.state.clone();
             let range = block.range.clone();
             let tasks = block.tasks.clone();
@@ -845,7 +913,7 @@ impl EditorDisplayProvider for MarkdownDisplay {
                     let task_state = state.clone();
                     let tasks = tasks.clone();
                     let view = TextView::markdown(SharedString::from(id.clone()), source.clone())
-                        .style(markdown_style(cx, &image_root).paragraph_gap(rems(0.25)))
+                        .style(markdown_style(cx, &image_root, &notes).paragraph_gap(rems(0.25)))
                         .markdown_extensions(code_block::extensions())
                         .on_task_toggle(move |offset, checked, window, cx| {
                             if let Some(task) = tasks
@@ -886,6 +954,9 @@ impl EditorDisplayProvider for MarkdownDisplay {
                             .size_full(),
                         )
                         .on_mouse_down(MouseButton::Left, move |event, window, cx| {
+                            if event.modifiers.secondary() {
+                                return;
+                            }
                             cx.stop_propagation();
                             let bounds = bounds.get();
                             let anchor = if event.position.y <= bounds.center().y {
