@@ -1,6 +1,7 @@
 pub(crate) mod advanced;
 mod document;
 mod format;
+pub(crate) mod incremental;
 mod inline;
 mod inline_flow;
 mod markdown_ext;

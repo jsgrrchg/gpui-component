@@ -129,6 +129,20 @@ opening behavior. If no handler is installed, links continue to use
 `App::open_url` as usual. The callback is used for both text links and linked
 images.
 
+## Incremental Updates
+
+Markdown `set_text` and streamed appends reuse unchanged root blocks. A local
+parse includes neighboring blocks and validates their ASTs and relative source
+positions before keeping the rest of the document. Retained formulas, diagrams
+and code blocks keep their parsed/render data. Source spans of later blocks are
+relocated to preserve selection copying and task callback offsets.
+
+Link definitions, footnotes, unstable boundaries, windows larger than 64 KiB,
+MDX and application block parsers use full parsing. Custom parser payloads may
+depend on the complete source or contain absolute offsets that TextView cannot
+relocate. Comparing complete input strings and moving spans remain linear;
+this optimization bounds the syntax analysis for ordinary local updates.
+
 ## Task Checkbox Handling
 
 Use `on_task_toggle` to make Markdown task checkboxes interactive, including

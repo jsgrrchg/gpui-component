@@ -104,6 +104,70 @@ enum BlockTextKind {
 }
 
 impl BlockNode {
+    /// Relocate reusable render data after an edit preceding this block.
+    pub(crate) fn shift_source(&mut self, delta: isize) {
+        fn span(span: &mut Option<Span>, delta: isize) {
+            if let Some(span) = span {
+                span.start = span
+                    .start
+                    .checked_add_signed(delta)
+                    .expect("Markdown span start");
+                span.end = span
+                    .end
+                    .checked_add_signed(delta)
+                    .expect("Markdown span end");
+            }
+        }
+        match self {
+            Self::Root {
+                children,
+                span: range,
+            }
+            | Self::Blockquote {
+                children,
+                span: range,
+            }
+            | Self::List {
+                children,
+                span: range,
+                ..
+            }
+            | Self::ListItem {
+                children,
+                span: range,
+                ..
+            } => {
+                span(range, delta);
+                for child in children {
+                    child.shift_source(delta);
+                }
+            }
+            Self::Paragraph(paragraph) => span(&mut paragraph.span, delta),
+            Self::Heading {
+                children,
+                span: range,
+                ..
+            } => {
+                span(range, delta);
+                span(&mut children.span, delta);
+            }
+            Self::CodeBlock(code) => span(&mut code.span, delta),
+            Self::Custom(node) => span(&mut node.span, delta),
+            Self::Table(table) => {
+                span(&mut table.span, delta);
+                for row in &mut table.children {
+                    for cell in &mut row.children {
+                        span(&mut cell.children.span, delta);
+                    }
+                }
+            }
+            Self::Break { span: range, .. }
+            | Self::HorizontalRule { span: range }
+            | Self::Definition { span: range, .. } => span(range, delta),
+            Self::Unknown => {}
+        }
+    }
+
     pub(super) fn is_list_item(&self) -> bool {
         matches!(self, Self::ListItem { .. })
     }

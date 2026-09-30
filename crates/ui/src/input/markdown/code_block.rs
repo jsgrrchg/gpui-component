@@ -31,8 +31,11 @@ const LINE_HEIGHT_RATIO: f32 = 18. / 12.5;
 
 /// One shared registry: `TextView` reparses whenever the extension revision
 /// changes, so the editor must not build a new registry on every render.
-static EXTENSIONS: LazyLock<MarkdownExtensions> =
-    LazyLock::new(|| MarkdownExtensions::default().plugin(CodeBlockPlugin));
+static EXTENSIONS: LazyLock<MarkdownExtensions> = LazyLock::new(|| {
+    MarkdownExtensions::default()
+        .plugin(CodeBlockPlugin)
+        .allow_incremental()
+});
 
 pub(super) fn extensions() -> MarkdownExtensions {
     EXTENSIONS.clone()

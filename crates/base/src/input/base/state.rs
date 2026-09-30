@@ -2744,6 +2744,11 @@ impl<M: InputModeKind> EntityInputHandler for InputBaseState<M> {
             M::reset_annotations(self);
         } else {
             M::adjust_annotations(self, &range, new_text.len());
+            if let Some(provider) = self.extras.display_provider() {
+                provider
+                    .borrow_mut()
+                    .text_changed(&old_text, &self.text, &range, new_text.len());
+            }
         }
         if mask_changed {
             // A segment-based history entry no longer matches the masked
@@ -2859,6 +2864,11 @@ impl<M: InputModeKind> EntityInputHandler for InputBaseState<M> {
         }
 
         M::adjust_annotations(self, &range, new_text.len());
+        if let Some(provider) = self.extras.display_provider() {
+            provider
+                .borrow_mut()
+                .text_changed(&old_text, &self.text, &range, new_text.len());
+        }
         if let Some(diagnostics) = self.mode.diagnostics_mut() {
             diagnostics.reset(&self.text)
         }

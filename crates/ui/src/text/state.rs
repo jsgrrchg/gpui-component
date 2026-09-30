@@ -337,7 +337,7 @@ impl TextViewState {
         if !append {
             self.selection_revision = self.selection_revision.wrapping_add(1);
         }
-        let update_options = UpdateOptions {
+        let mut update_options = UpdateOptions {
             revision: self.revision,
             append,
             mode: if append {
@@ -347,6 +347,7 @@ impl TextViewState {
             },
             pending_text: text.to_string(),
             markdown_extensions: self.markdown_extensions.clone(),
+            baseline: None,
         };
 
         // Full-replace updates (initial content / `set_text`) parse
@@ -359,9 +360,10 @@ impl TextViewState {
         // thumb jitters. Streaming appends stay async to avoid re-parsing the
         // whole document on every chunk.
         if !append {
-            match parse_content(self.format, ParsedContent::default(), &update_options) {
+            match parse_content(self.format, self.parsed_content.clone(), &update_options) {
                 Ok(content) => {
                     self.parsed_content = content;
+                    update_options.baseline = Some(self.parsed_content.clone());
                     self.parsed_error = None;
                     if !self.is_selecting {
                         self.reset_selection_and_adapter(cx);
@@ -627,6 +629,8 @@ impl Render for TextViewState {
 pub(crate) struct ParsedContent {
     pub(crate) document: ParsedDocument,
     pub(crate) node_cx: node::NodeContext,
+    markdown_index: super::incremental::MarkdownIndex,
+    markdown_revision: u64,
 }
 
 struct UpdateFuture {
@@ -661,7 +665,21 @@ impl Future for UpdateFuture {
                     let hit_coalesce_budget =
                         merge_pending_options(&mut options, self.rx.as_ref().get_ref());
 
-                    let res = parse_content(self.format, self.content.clone(), &options);
+                    if options.mode == ParseMode::BaselineAck
+                        && let Some(baseline) = options.baseline.take()
+                    {
+                        self.content = baseline;
+                        if hit_coalesce_budget {
+                            cx.waker().wake_by_ref();
+                            return Poll::Pending;
+                        }
+                        continue;
+                    }
+                    let previous = options
+                        .baseline
+                        .take()
+                        .unwrap_or_else(|| self.content.clone());
+                    let res = parse_content(self.format, previous, &options);
                     if let Ok(content) = &res {
                         self.content = content.clone();
                     }
@@ -692,6 +710,8 @@ struct UpdateOptions {
     append: bool,
     mode: ParseMode,
     markdown_extensions: Arc<MarkdownExtensions>,
+    /// Synchronize the worker without parsing the synchronous result twice.
+    baseline: Option<ParsedContent>,
 }
 
 impl UpdateOptions {
@@ -745,6 +765,56 @@ fn parse_content(
         markdown_extensions: options.markdown_extensions.clone(),
         ..NodeContext::default()
     };
+
+    if format == TextViewFormat::Markdown {
+        let source = if options.append {
+            format!("{}{}", content.document.source, options.pending_text)
+        } else {
+            options.pending_text.clone()
+        };
+        let revision = options.markdown_extensions.revision();
+        if content.markdown_revision == revision
+            && options.markdown_extensions.supports_incremental()
+        {
+            let edit = if options.append {
+                super::incremental::MarkdownEdit {
+                    range: content.document.source.len()..content.document.source.len(),
+                    new_len: options.pending_text.len(),
+                }
+            } else {
+                super::incremental::edit_between(&content.document.source, &source)
+            };
+            if let Some(fragment) = content.markdown_index.reparse(
+                source.len(),
+                &edit,
+                |range| source[range].to_string(),
+                &options.markdown_extensions.parse_options(),
+            ) {
+                node_cx.offset = fragment.offset;
+                let parsed = format::markdown::ast_to_document(
+                    &fragment.source,
+                    fragment.root,
+                    &mut node_cx,
+                );
+                let delta = source.len() as isize - content.document.source.len() as isize;
+                for block in &mut content.document.blocks[fragment.old_blocks.end..] {
+                    block.shift_source(delta);
+                }
+                content
+                    .document
+                    .blocks
+                    .splice(fragment.old_blocks, parsed.blocks);
+                content.document.source = source.into();
+                return Ok(content);
+            }
+        }
+        let (document, index) = format::markdown::parse_indexed(&source, &mut node_cx)?;
+        content.document = document;
+        content.markdown_index = index;
+        content.markdown_revision = revision;
+        content.node_cx = node_cx;
+        return Ok(content);
+    }
 
     let mut source = String::new();
     if options.append
@@ -837,6 +907,7 @@ mod tests {
             append: true,
             mode: ParseMode::Compatible,
             markdown_extensions: Arc::default(),
+            baseline: None,
         };
 
         options.merge(UpdateOptions {
@@ -845,6 +916,7 @@ mod tests {
             append: false,
             mode: ParseMode::BaselineAck,
             markdown_extensions: Arc::default(),
+            baseline: None,
         });
         options.merge(UpdateOptions {
             revision: 3,
@@ -852,6 +924,7 @@ mod tests {
             append: true,
             mode: ParseMode::Compatible,
             markdown_extensions: Arc::default(),
+            baseline: None,
         });
 
         assert_eq!(options.revision, 3);
@@ -876,6 +949,7 @@ mod tests {
                     ParseMode::Compatible
                 },
                 markdown_extensions: Arc::default(),
+                baseline: None,
             })
             .unwrap();
         }

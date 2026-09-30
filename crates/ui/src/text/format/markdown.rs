@@ -14,9 +14,19 @@ use crate::text::{
 
 /// Parse Markdown into a tree of nodes.
 pub(crate) fn parse(source: &str, cx: &mut NodeContext) -> Result<ParsedDocument, SharedString> {
+    parse_indexed(source, cx).map(|(document, _)| document)
+}
+
+pub(crate) fn parse_indexed(
+    source: &str,
+    cx: &mut NodeContext,
+) -> Result<(ParsedDocument, crate::text::incremental::MarkdownIndex), SharedString> {
     let options = cx.markdown_extensions.parse_options();
     crate::text::wiki::parse(source, &options)
-        .map(|n| ast_to_document(source, n, cx))
+        .map(|n| {
+            let index = crate::text::incremental::MarkdownIndex::new(source, &n);
+            (ast_to_document(source, n, cx), index)
+        })
         .map_err(|e| e.to_string().into())
 }
 
@@ -353,7 +363,11 @@ fn parse_paragraph(
     text
 }
 
-fn ast_to_document(source: &str, root: mdast::Node, cx: &mut NodeContext) -> ParsedDocument {
+pub(crate) fn ast_to_document(
+    source: &str,
+    root: mdast::Node,
+    cx: &mut NodeContext,
+) -> ParsedDocument {
     let root = match root {
         Node::Root(r) => r,
         _ => panic!("expected root node"),

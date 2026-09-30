@@ -37,6 +37,18 @@ pub struct EditorDisplay {
 
 /// Provides a presentation without changing the editable document.
 pub trait EditorDisplayProvider {
+    /// A source replacement, with byte positions in the previous snapshot.
+    /// The new Rope is supplied after the replacement. Consumers can record
+    /// edits here and defer analysis until the next display request.
+    fn text_changed(
+        &mut self,
+        _old_text: &Rope,
+        _text: &Rope,
+        _range: &Range<usize>,
+        _new_len: usize,
+    ) {
+    }
+
     /// An optional navigation target under the source caret.
     fn link_at(&self, _offset: usize) -> Option<SharedString> {
         None

@@ -173,15 +173,37 @@ impl PartialEq for MarkdownNode {
 }
 
 /// Registry for custom Markdown parsing and rendering.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct MarkdownExtensions {
     enable_mdx: bool,
     block_parsers: Vec<Arc<MarkdownBlockParserFn>>,
     block_renderers: HashMap<SharedString, Arc<MarkdownBlockRenderFn>>,
     revision: u64,
+    incremental_safe: bool,
+}
+
+impl Default for MarkdownExtensions {
+    fn default() -> Self {
+        Self {
+            enable_mdx: false,
+            block_parsers: Vec::new(),
+            block_renderers: HashMap::new(),
+            revision: 0,
+            incremental_safe: true,
+        }
+    }
 }
 
 impl MarkdownExtensions {
+    pub(crate) fn supports_incremental(&self) -> bool {
+        !self.enable_mdx && self.incremental_safe
+    }
+
+    /// Internal parsers whose payloads do not store absolute source positions.
+    pub(crate) fn allow_incremental(mut self) -> Self {
+        self.incremental_safe = true;
+        self
+    }
     /// Enable MDX JSX/expression constructs.
     ///
     /// This disables raw HTML constructs because `markdown-rs` gives HTML
@@ -247,6 +269,9 @@ impl MarkdownExtensions {
             + 'static,
     {
         self.block_parsers.push(Arc::new(parser));
+        // Application payloads may contain absolute positions or depend on the
+        // whole source. Those cannot safely be relocated by TextView.
+        self.incremental_safe = false;
         self.bump_revision();
     }
 

@@ -1,9 +1,10 @@
 use std::{
     cell::{Cell, RefCell},
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     ops::Range,
     path::PathBuf,
     rc::Rc,
+    sync::atomic::{AtomicU64, Ordering},
 };
 
 use gpui::{
@@ -19,10 +20,13 @@ use gpui_base::input::{
 use markdown::mdast::Node;
 
 use super::EditorState;
+use crate::text::incremental::{MarkdownEdit, MarkdownIndex, ReparsedMarkdown};
 use crate::{
     ActiveTheme, IconName, IconNamed as _,
     text::{MarkdownNotes, TableAppearance, TextView, TextViewStyle},
 };
+
+static NEXT_BLOCK_ID: AtomicU64 = AtomicU64::new(1);
 
 mod code_block;
 mod code_editor;
@@ -58,6 +62,8 @@ pub(super) struct MarkdownReadingPreview {
     state: Entity<EditorState>,
     _subscription: Subscription,
     _observation: Subscription,
+    text: super::Rope,
+    source: SharedString,
 }
 
 pub(super) fn reading_preview(
@@ -78,6 +84,8 @@ pub(super) fn reading_preview(
             MarkdownReadingPreview {
                 _observation: cx.observe(&state, |_, _, cx| cx.notify()),
                 state,
+                text: super::Rope::new(),
+                source: SharedString::default(),
                 _subscription: subscription,
             }
         },
@@ -91,9 +99,14 @@ impl Render for MarkdownReadingPreview {
             let display = display.borrow();
             (display.image_root.clone(), display.notes.clone())
         };
+        let text = self.state.read(cx).text();
+        if !ropey::extra::esoterica::ropes_are_instances(&self.text, text) {
+            self.source = text.to_string().into();
+            self.text = text.clone();
+        }
         TextView::markdown(
             SharedString::from(format!("markdown-preview-{:?}", self.state.entity_id())),
-            self.state.read(cx).value(),
+            self.source.clone(),
         )
         .style(markdown_style(cx, &image_root, &notes))
         .markdown_extensions(code_block::extensions())
@@ -120,11 +133,14 @@ struct Markup {
 }
 
 struct Block {
+    id: u64,
     range: Range<usize>,
     source_start: usize,
     source: SharedString,
     tasks: Vec<Task>,
     code: Option<code_editor::FencedCode>,
+    /// Includes code fences not eligible for a nested editable code view.
+    code_fence: bool,
     cache: Rc<RefCell<EditorDisplayBlockCache>>,
 }
 
@@ -311,13 +327,175 @@ fn replacement(range: Range<usize>, text: impl Into<SharedString>) -> DisplayRep
     }
 }
 
+fn shift_range(range: &mut Range<usize>, delta: isize) {
+    range.start = range
+        .start
+        .checked_add_signed(delta)
+        .expect("Markdown range start");
+    range.end = range
+        .end
+        .checked_add_signed(delta)
+        .expect("Markdown range end");
+}
+
+impl Task {
+    fn shift(&mut self, delta: isize) {
+        self.start = self
+            .start
+            .checked_add_signed(delta)
+            .expect("Markdown task start");
+        shift_range(&mut self.marker, delta);
+        shift_range(&mut self.glyph, delta);
+        shift_range(&mut self.line, delta);
+    }
+}
+
+impl Block {
+    fn shift(&mut self, delta: isize) {
+        shift_range(&mut self.range, delta);
+        self.source_start = self
+            .source_start
+            .checked_add_signed(delta)
+            .expect("Markdown block start");
+        for task in &mut self.tasks {
+            task.shift(delta);
+        }
+        if let Some(code) = &mut self.code {
+            shift_range(&mut code.content, delta);
+        }
+    }
+}
+
+impl Markup {
+    fn shift(&mut self, delta: isize) {
+        shift_range(&mut self.range, delta);
+        for replacement in &mut self.replacements {
+            shift_range(&mut replacement.range, delta);
+        }
+    }
+}
+
+fn splice_items<T>(
+    items: &mut Vec<T>,
+    replacements: Vec<T>,
+    range: &Range<usize>,
+    delta: isize,
+    start: impl Fn(&T) -> usize,
+    shift: impl Fn(&mut T, isize),
+) {
+    items.retain_mut(|item| {
+        let offset = start(item);
+        if range.contains(&offset) {
+            return false;
+        }
+        if offset >= range.end {
+            shift(item, delta);
+        }
+        true
+    });
+    items.extend(replacements);
+}
+
 impl MarkdownDocument {
+    fn reuse_blocks<'a>(&mut self, previous: impl IntoIterator<Item = &'a Block>) {
+        let mut caches: HashMap<SharedString, VecDeque<_>> = HashMap::new();
+        for block in previous {
+            caches
+                .entry(block.source.clone())
+                .or_default()
+                .push_back((block.id, block.cache.clone()));
+        }
+        for block in &mut self.blocks {
+            if let Some((id, cache)) = caches.get_mut(&block.source).and_then(VecDeque::pop_front) {
+                block.id = id;
+                block.cache = cache;
+            }
+        }
+    }
+
+    fn splice(&mut self, reparsed: ReparsedMarkdown) {
+        let mut fragment = Self::from_root(&reparsed.source, &reparsed.root);
+        fragment.reuse_blocks(
+            self.blocks
+                .iter()
+                .filter(|block| reparsed.old_range.contains(&block.range.start)),
+        );
+        let offset = reparsed.offset as isize;
+        for markup in &mut fragment.markup {
+            markup.shift(offset);
+        }
+        for block in &mut fragment.blocks {
+            block.shift(offset);
+        }
+        for (range, _) in &mut fragment.links {
+            shift_range(range, offset);
+        }
+        for task in &mut fragment.tasks {
+            task.shift(offset);
+        }
+        let delta = reparsed.new_range.len() as isize - reparsed.old_range.len() as isize;
+        let range = &reparsed.old_range;
+        splice_items(
+            &mut self.markup,
+            fragment.markup,
+            range,
+            delta,
+            |item| item.range.start,
+            Markup::shift,
+        );
+        splice_items(
+            &mut self.blocks,
+            fragment.blocks,
+            range,
+            delta,
+            |item| item.range.start,
+            Block::shift,
+        );
+        splice_items(
+            &mut self.links,
+            fragment.links,
+            range,
+            delta,
+            |item| item.0.start,
+            |item, delta| shift_range(&mut item.0, delta),
+        );
+        splice_items(
+            &mut self.tasks,
+            fragment.tasks,
+            range,
+            delta,
+            |item| item.start,
+            Task::shift,
+        );
+        self.blocks.sort_by_key(|block| block.range.start);
+        self.tasks.sort_by_key(|task| task.start);
+        self.fenced_code_blocks = 0;
+        for block in &mut self.blocks {
+            if block.code_fence {
+                if let Some(code) = &mut block.code {
+                    code.ordinal = self.fenced_code_blocks;
+                }
+                self.fenced_code_blocks += 1;
+            }
+        }
+    }
+
+    #[cfg(test)]
     fn parse(source: &str) -> Self {
-        let mut document = Self::default();
+        Self::parse_indexed(source).0
+    }
+
+    fn parse_indexed(source: &str) -> (Self, MarkdownIndex) {
         let Ok(root) = crate::text::wiki::parse(source, &crate::text::advanced::parse_options())
         else {
-            return document;
+            return (Self::default(), MarkdownIndex::default());
         };
+        let index = MarkdownIndex::new(source, &root);
+        (Self::from_root(source, &root), index)
+    }
+
+    fn from_root(source: &str, root: &Node) -> Self {
+        let mut document = Self::default();
         let definitions = root
             .children()
             .into_iter()
@@ -390,11 +568,13 @@ impl MarkdownDocument {
                 None
             };
             self.blocks.push(Block {
+                id: NEXT_BLOCK_ID.fetch_add(1, Ordering::Relaxed),
                 range: line_range(source, &range),
                 source_start: range.start,
                 source: format!("{}{}", &source[range], self.definitions).into(),
                 tasks,
                 code,
+                code_fence: matches!(node, Node::Code(code) if !crate::text::advanced::is_advanced_fence(code.lang.as_deref())),
                 cache: Rc::default(),
             });
             return;
@@ -573,6 +753,9 @@ struct MarkdownDisplay {
     state: WeakEntity<EditorState>,
     text: super::Rope,
     document: MarkdownDocument,
+    index: MarkdownIndex,
+    pending_edit: Option<MarkdownEdit>,
+    pending_text: Option<super::Rope>,
     /// Keep the projection stable during mouse selection, including mouse down.
     last_display: Option<EditorDisplay>,
     code_focus: Rc<RefCell<code_editor::CodeFocus>>,
@@ -594,6 +777,9 @@ fn display_state(
                 state: weak,
                 text: super::Rope::new(),
                 document: MarkdownDocument::default(),
+                index: MarkdownIndex::default(),
+                pending_edit: None,
+                pending_text: None,
                 last_display: None,
                 code_focus: Rc::default(),
                 task_glyphs: Vec::new(),
@@ -742,6 +928,49 @@ pub(super) fn task_mouse_down(
 }
 
 impl EditorDisplayProvider for MarkdownDisplay {
+    fn text_changed(
+        &mut self,
+        old_text: &super::Rope,
+        text: &super::Rope,
+        range: &Range<usize>,
+        new_len: usize,
+    ) {
+        let previous = self.pending_text.as_ref().unwrap_or(&self.text);
+        if !ropey::extra::esoterica::ropes_are_instances(previous, old_text) {
+            self.pending_edit = None;
+        } else if let Some(edit) = &mut self.pending_edit {
+            // Map the next edit back into the parsed snapshot. Positions inside
+            // the previous replacement belong to its entire old source range.
+            let new_end = edit.range.start + edit.new_len;
+            let delta = edit.new_len as isize - edit.range.len() as isize;
+            let start = if range.start < edit.range.start {
+                range.start
+            } else if range.start <= new_end {
+                edit.range.start
+            } else {
+                range.start.checked_add_signed(-delta).unwrap()
+            };
+            let end = if range.end < edit.range.start {
+                range.end
+            } else if range.end <= new_end {
+                edit.range.end
+            } else {
+                range.end.checked_add_signed(-delta).unwrap()
+            };
+            let combined = start.min(edit.range.start)..end.max(edit.range.end);
+            edit.new_len = combined
+                .len()
+                .checked_add_signed(delta + new_len as isize - range.len() as isize)
+                .unwrap();
+            edit.range = combined;
+        } else if self.pending_text.is_none() {
+            self.pending_edit = Some(MarkdownEdit {
+                range: range.clone(),
+                new_len,
+            });
+        }
+        self.pending_text = Some(text.clone());
+    }
     fn link_handler(&self) -> Option<Rc<dyn Fn(&SharedString, &mut Window, &mut App)>> {
         let notes = self.notes.clone();
         Some(Rc::new(move |url, window, cx| {
@@ -783,21 +1012,34 @@ impl EditorDisplayProvider for MarkdownDisplay {
             return display.clone();
         }
         if !unchanged {
-            let source = text.to_string();
-            let caches = self
-                .document
-                .blocks
-                .iter()
-                .map(|block| (block.source.clone(), block.cache.clone()))
-                .collect::<HashMap<_, _>>();
-            self.document = MarkdownDocument::parse(&source);
-            for block in &mut self.document.blocks {
-                if let Some(cache) = caches.get(&block.source) {
-                    block.cache = cache.clone();
-                }
+            let reparsed = self
+                .pending_edit
+                .as_ref()
+                .filter(|_| {
+                    self.pending_text.as_ref().is_some_and(|pending| {
+                        ropey::extra::esoterica::ropes_are_instances(pending, text)
+                    })
+                })
+                .and_then(|edit| {
+                    self.index.reparse(
+                        text.len(),
+                        edit,
+                        |range| text.slice(range).to_string(),
+                        &crate::text::advanced::parse_options(),
+                    )
+                });
+            if let Some(reparsed) = reparsed {
+                self.document.splice(reparsed);
+            } else {
+                let (mut document, index) = MarkdownDocument::parse_indexed(&text.to_string());
+                document.reuse_blocks(self.document.blocks.iter());
+                self.document = document;
+                self.index = index;
             }
             self.text = text.clone();
         }
+        self.pending_edit = None;
+        self.pending_text = None;
         let active = focused || !selection.is_empty();
         self.task_glyphs = self
             .document
@@ -907,11 +1149,7 @@ impl EditorDisplayProvider for MarkdownDisplay {
             let range = block.range.clone();
             let tasks = block.tasks.clone();
             let source_start = block.source_start;
-            let id = format!(
-                "markdown-block-{:?}-{}",
-                self.state.entity_id(),
-                range.start
-            );
+            let id = format!("markdown-block-{:?}-{}", self.state.entity_id(), block.id);
             display.blocks.push(EditorDisplayBlock {
                 range: range.clone(),
                 cache: block.cache.clone(),

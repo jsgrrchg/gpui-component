@@ -114,6 +114,27 @@ During mouse selection, the live preview keeps its current formatting and
 layout. The selected Markdown source is revealed when the left button is
 released, including when released outside the editor.
 
+### Incremental Markdown analysis
+
+Live preview records byte edits, including undo/redo and IME replacements, and
+coalesces edits before the next display update. Both preview modes reparse the
+affected root blocks with neighboring blocks as boundary guards. The guards
+must retain the exact AST and relative positions. Unchanged blocks keep their
+render data; rendered blocks in Live preview also keep a stable identity when
+their source position moves.
+
+Analysis falls back to the whole document when boundaries do not stabilize,
+when the document contains link definitions or footnotes, or when the proposed
+window exceeds 64 KiB. A long paragraph or list is one root block. TextView also
+uses full analysis for MDX and application block parsers whose payloads may
+contain source positions. The editor's built-in code renderer supports reuse.
+
+This reduces parsing work for local edits. Relocating suffix ranges and
+rebuilding the editor projection
+still depend on document size. Reading Preview also copies the changed source
+and locates the difference between complete strings. Its background worker
+receives the synchronous parsed result without analyzing it a second time.
+
 ### Links and embeds between notes
 
 Both preview modes support `[[note]]`, `[[note|Label]]`, and `![[note]]`.
