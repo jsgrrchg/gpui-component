@@ -6,9 +6,10 @@ use std::{
 };
 
 use gpui::{
-    App, Bounds, Context, Entity, EntityInputHandler, FontStyle, FontWeight, HighlightStyle,
-    InteractiveElement, IntoElement, MouseButton, MouseDownEvent, ParentElement, Pixels, Render,
-    SharedString, Styled, Subscription, WeakEntity, Window, canvas, div, px, rems,
+    App, BorderStyle, Bounds, ContentMask, Context, Entity, EntityInputHandler, FontStyle,
+    FontWeight, HighlightStyle, InteractiveElement, IntoElement, MouseButton, MouseDownEvent,
+    ParentElement, Pixels, Render, SharedString, Styled, Subscription, TransformationMatrix,
+    WeakEntity, Window, canvas, div, point, px, quad, rems, size,
 };
 use gpui_base::input::{
     DisplayReplacement, EditorDisplay, EditorDisplayBlock, EditorDisplayBlockCache,
@@ -18,7 +19,7 @@ use markdown::mdast::Node;
 
 use super::EditorState;
 use crate::{
-    ActiveTheme,
+    ActiveTheme, IconName, IconNamed as _,
     text::{TextView, TextViewStyle},
 };
 
@@ -95,7 +96,6 @@ enum Mark {
     Code,
     Link,
     Highlight,
-    Task,
 }
 
 struct Markup {
@@ -113,10 +113,11 @@ struct Block {
     cache: Rc<RefCell<EditorDisplayBlockCache>>,
 }
 
-/// Glyphs for task markers shown as source text. U+FE0E asks for the text
-/// presentation; ☑ otherwise resolves to an emoji font that may not render.
-const CHECKED_TASK: &str = "☑\u{FE0E}";
-const UNCHECKED_TASK: &str = "☐\u{FE0E}";
+/// Room reserved in the text for a task's checkbox, which is painted over it.
+/// Font glyphs such as U+2610 and U+2611 are clipped or missing in some fonts.
+const TASK_PLACEHOLDER: &str = "\u{2003}\u{2002}";
+/// Zeron's checkbox, scaled down to fit a text line.
+const TASK_CHECKBOX_SIZE: f32 = 14.;
 
 #[derive(Clone)]
 struct Task {
@@ -486,28 +487,14 @@ impl MarkdownDocument {
         }
     }
 
-    /// Show a task marker as a checkbox glyph (Zeron's composer), except
-    /// while its line is active.
+    /// Show a task marker as a checkbox (Zeron's composer), except while its
+    /// line is active. The text keeps room that [`task_checkboxes`] paints.
     fn task_glyph(&mut self, task: &Task) {
         self.markup.push(Markup {
             range: task.line.clone(),
             mark: None,
-            replacements: vec![replacement(
-                task.glyph.clone(),
-                if task.checked {
-                    CHECKED_TASK
-                } else {
-                    UNCHECKED_TASK
-                },
-            )],
+            replacements: vec![replacement(task.glyph.clone(), TASK_PLACEHOLDER)],
         });
-        if task.checked {
-            self.markup.push(Markup {
-                range: task.glyph.clone(),
-                mark: Some(Mark::Task),
-                replacements: Vec::new(),
-            });
-        }
     }
 
     fn highlights(&mut self, text: &str, start: usize) {
@@ -589,6 +576,68 @@ pub(super) fn provider(
     cx: &mut App,
 ) -> SharedEditorDisplayProvider {
     display_state(state, window, cx)
+}
+
+/// Paint the checkboxes of tasks whose marker is hidden, over the room
+/// their line reserves.
+pub(super) fn task_checkboxes(
+    state: &Entity<EditorState>,
+    window: &mut Window,
+    cx: &mut App,
+) -> impl IntoElement {
+    let display = display_state(state, window, cx);
+    let state = state.clone();
+    canvas(
+        |_, _, _| {},
+        move |bounds, _, window, cx| {
+            let tasks = display.borrow().task_glyphs.clone();
+            let theme = cx.theme();
+            let (primary, foreground, border) =
+                (theme.primary, theme.primary_foreground, theme.border);
+            window.with_content_mask(Some(ContentMask { bounds }), |window| {
+                for task in tasks {
+                    let Some(room) = state.read(cx).range_to_bounds(&task.glyph) else {
+                        continue;
+                    };
+                    let side = px(TASK_CHECKBOX_SIZE).min(room.size.height - px(4.));
+                    let checkbox = Bounds::new(
+                        point(room.origin.x + px(1.), room.center().y - side / 2.),
+                        size(side, side),
+                    );
+                    window.paint_quad(quad(
+                        checkbox,
+                        px(3.),
+                        if task.checked {
+                            primary
+                        } else {
+                            gpui::transparent_black()
+                        },
+                        px(1.),
+                        if task.checked { primary } else { border },
+                        BorderStyle::Solid,
+                    ));
+                    if task.checked {
+                        let inset = side * 0.15;
+                        _ = window.paint_svg(
+                            Bounds::new(
+                                checkbox.origin + point(inset, inset),
+                                size(side - inset * 2., side - inset * 2.),
+                            ),
+                            IconName::Check.path(),
+                            None,
+                            TransformationMatrix::unit(),
+                            foreground,
+                            cx,
+                        );
+                    }
+                }
+            });
+        },
+    )
+    .absolute()
+    .top_0()
+    .left_0()
+    .size_full()
 }
 
 /// Toggle a task when its checkbox glyph is clicked, before the editor moves
@@ -701,10 +750,6 @@ impl EditorDisplayProvider for MarkdownDisplay {
                 },
                 Mark::Highlight => HighlightStyle {
                     background_color: Some(cx.theme().warning.opacity(0.25)),
-                    ..Default::default()
-                },
-                Mark::Task => HighlightStyle {
-                    color: Some(cx.theme().primary),
                     ..Default::default()
                 },
             };
@@ -1440,7 +1485,7 @@ mod tests {
         let todo = source.find("todo").unwrap();
         assert_eq!(
             projected(source, todo..todo, true),
-            "☑\u{FE0E} done\n- [ ] todo\n1. ☑\u{FE0E} ordered\n> ☐\u{FE0E} quoted\n\nend"
+            "\u{2003}\u{2002} done\n- [ ] todo\n1. \u{2003}\u{2002} ordered\n> \u{2003}\u{2002} quoted\n\nend"
         );
     }
 
@@ -1450,12 +1495,12 @@ mod tests {
         assert!(MarkdownDocument::parse(source).blocks.is_empty());
         assert_eq!(
             projected(source, 2..2, true),
-            "- One\n• Two bold\n\n☑\u{FE0E} Open\n☐\u{FE0E} Click"
+            "- One\n• Two bold\n\n\u{2003}\u{2002} Open\n\u{2003}\u{2002} Click"
         );
         let click = source.find("Click").unwrap();
         assert_eq!(
             projected(source, click..click, true),
-            "• One\n• Two bold\n\n☑\u{FE0E} Open\n- [ ] Click"
+            "• One\n• Two bold\n\n\u{2003}\u{2002} Open\n- [ ] Click"
         );
     }
 

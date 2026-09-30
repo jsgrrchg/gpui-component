@@ -169,8 +169,10 @@ impl RenderOnce for Editor {
             .size_full()
             .when_some(self.height, |this, height| this.h(height))
             .refine_style(&self.style)
+            .relative()
             .capture_any_mouse_down(task_mouse_down)
             .child(input.size_full().refine_style(&text_style))
+            .child(super::markdown::task_checkboxes(&self.state, window, cx))
             .into_any_element()
     }
 }
