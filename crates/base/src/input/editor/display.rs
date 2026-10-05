@@ -64,6 +64,10 @@ pub trait EditorDisplayProvider {
     ) {
     }
 
+    /// Schedule presentation analysis before layout. Implementations must keep
+    /// this cheap and publish background results without changing the source.
+    fn prepare(&mut self, _text: &Rope, _cx: &mut App) {}
+
     /// An optional navigation target under the source caret.
     fn link_at(&self, _offset: usize) -> Option<SharedString> {
         None

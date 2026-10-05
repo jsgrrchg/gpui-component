@@ -3,7 +3,7 @@ use std::{
     collections::{HashMap, VecDeque},
     ops::Range,
     path::PathBuf,
-    rc::Rc,
+    rc::{Rc, Weak},
     sync::atomic::{AtomicU64, Ordering},
 };
 
@@ -126,12 +126,14 @@ enum Mark {
     Highlight,
 }
 
+#[derive(Clone)]
 struct Markup {
     range: Range<usize>,
     mark: Option<Mark>,
     replacements: Vec<DisplayReplacement>,
 }
 
+#[derive(Clone)]
 struct Block {
     id: u64,
     range: Range<usize>,
@@ -291,7 +293,7 @@ fn decoded_replacements(raw: &str, decoded: &str, start: usize) -> Vec<DisplayRe
     }
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct MarkdownDocument {
     markup: Vec<Markup>,
     blocks: Vec<Block>,
@@ -400,6 +402,77 @@ fn splice_items<T>(
 }
 
 impl MarkdownDocument {
+    /// Preserve unaffected presentation and its geometry while parsing catches
+    /// up. Dirty tokens show their editable source instead of stale mappings.
+    fn project_edit(&mut self, text: &super::Rope, range: &Range<usize>, new_len: usize) {
+        let delta = new_len as isize - range.len() as isize;
+        let unaffected = |item: &mut Range<usize>| {
+            if item.end < range.start {
+                return true;
+            }
+            if item.start > range.end {
+                shift_range(item, delta);
+                return true;
+            }
+            false
+        };
+        self.markup.retain_mut(|item| {
+            if item.range.end < range.start {
+                true
+            } else if item.range.start > range.end {
+                item.shift(delta);
+                true
+            } else {
+                false
+            }
+        });
+        self.links.retain_mut(|(item, _)| unaffected(item));
+        self.tasks.retain_mut(|task| {
+            if task.line.end < range.start {
+                true
+            } else if task.line.start > range.end {
+                task.shift(delta);
+                true
+            } else {
+                false
+            }
+        });
+        self.blocks.retain_mut(|block| {
+            if block.range.end < range.start {
+                return true;
+            }
+            if block.range.start > range.end {
+                block.shift(delta);
+                return true;
+            }
+            if let Some(code) = &mut block.code
+                && range.start >= code.content.start
+                && range.end <= code.content.end
+            {
+                block.range.end = block.range.end.checked_add_signed(delta).unwrap();
+                code.content.end = code.content.end.checked_add_signed(delta).unwrap();
+                let raw = text.slice(block.range.clone()).to_string();
+                let lines = text.slice(code.content.clone()).to_string();
+                let value = lines.strip_suffix('\n').unwrap_or(&lines);
+                let Some(mut updated) = code_editor::fenced_code(
+                    &raw,
+                    &(0..raw.len()),
+                    code.lang.as_deref(),
+                    value,
+                    code.ordinal,
+                ) else {
+                    return false;
+                };
+                shift_range(&mut updated.content, block.range.start as isize);
+                block.source = (raw + &self.definitions).into();
+                block.code = Some(updated);
+                block.cache = Rc::default();
+                return true;
+            }
+            false
+        });
+    }
+
     fn reuse_blocks<'a>(&mut self, previous: impl IntoIterator<Item = &'a Block>) {
         let mut caches: HashMap<SharedString, VecDeque<_>> = HashMap::new();
         for block in previous {
@@ -488,6 +561,7 @@ impl MarkdownDocument {
         Self::parse_indexed(source).0
     }
 
+    #[cfg(test)]
     fn parse_indexed(source: &str) -> (Self, MarkdownIndex) {
         let Ok(root) = crate::text::wiki::parse(source, &crate::text::advanced::parse_options())
         else {
@@ -752,11 +826,115 @@ impl MarkdownDocument {
     }
 }
 
+/// Sendable parser output. UI caches and nested editors stay on the UI thread.
+enum Analysis {
+    Partial(ReparsedMarkdown),
+    Full(String, Option<Node>),
+}
+
+fn rope_edit(old: &super::Rope, new: &super::Rope) -> MarkdownEdit {
+    let start = old
+        .chars()
+        .zip(new.chars())
+        .take_while(|(a, b)| a == b)
+        .map(|(c, _)| c.len_utf8())
+        .sum::<usize>();
+    let suffix = old
+        .slice(start..)
+        .chars_at(old.len() - start)
+        .reversed()
+        .zip(new.slice(start..).chars_at(new.len() - start).reversed())
+        .take_while(|(a, b)| a == b)
+        .map(|(c, _)| c.len_utf8())
+        .sum::<usize>();
+    MarkdownEdit {
+        range: start..old.len() - suffix,
+        new_len: new.len() - start - suffix,
+    }
+}
+
+impl MarkdownDisplay {
+    fn new(state: WeakEntity<EditorState>) -> Rc<RefCell<Self>> {
+        Rc::new_cyclic(|weak_self| {
+            RefCell::new(MarkdownDisplay {
+                state,
+                text: super::Rope::new(),
+                document: MarkdownDocument::default(),
+                index: MarkdownIndex::default(),
+                parsed_document: MarkdownDocument::default(),
+                parsed_text: super::Rope::new(),
+                weak_self: weak_self.clone(),
+                parse_task: None,
+                revision: 0,
+                ready: None,
+                #[cfg(test)]
+                parse_gate: None,
+                #[cfg(test)]
+                parse_counts: (0, 0, 0),
+                pending_edit: None,
+                pending_text: None,
+                last_display: None,
+                code_focus: Rc::default(),
+                task_glyphs: Vec::new(),
+                image_root: None,
+                notes: None,
+            })
+        })
+    }
+
+    fn accept(&mut self, text: super::Rope, index: MarkdownIndex, analysis: Analysis) {
+        let mut document = match analysis {
+            Analysis::Partial(reparsed) => {
+                let mut document = self.parsed_document.clone();
+                document.splice(reparsed);
+                document
+            }
+            Analysis::Full(source, root) => root
+                .as_ref()
+                .map(|root| MarkdownDocument::from_root(&source, root))
+                .unwrap_or_default(),
+        };
+        document.reuse_blocks(self.document.blocks.iter());
+        // Content edits keep the nested editor mounted, including focus/IME.
+        let code_ids: HashMap<_, _> = self
+            .document
+            .blocks
+            .iter()
+            .filter(|block| block.code.is_some())
+            .map(|block| ((block.range.start, block.range.end), block.id))
+            .collect();
+        for block in &mut document.blocks {
+            if block.code.is_some()
+                && let Some(id) = code_ids.get(&(block.range.start, block.range.end))
+            {
+                block.id = *id;
+            }
+        }
+        self.document = document;
+        self.parsed_document = self.document.clone();
+        self.index = index;
+        self.parsed_text = text;
+        self.pending_edit = None;
+        self.pending_text = None;
+        self.last_display = None;
+    }
+}
+
 struct MarkdownDisplay {
     state: WeakEntity<EditorState>,
     text: super::Rope,
     document: MarkdownDocument,
     index: MarkdownIndex,
+    parsed_document: MarkdownDocument,
+    parsed_text: super::Rope,
+    weak_self: Weak<RefCell<Self>>,
+    parse_task: Option<gpui::Task<()>>,
+    revision: u64,
+    ready: Option<(u64, super::Rope, MarkdownIndex, Analysis)>,
+    #[cfg(test)]
+    parse_gate: Option<crate::async_util::Receiver<()>>,
+    #[cfg(test)]
+    parse_counts: (usize, usize, usize),
     pending_edit: Option<MarkdownEdit>,
     pending_text: Option<super::Rope>,
     /// Keep the projection stable during mouse selection, including mouse down.
@@ -776,19 +954,7 @@ fn display_state(
     let weak = state.downgrade();
     window
         .use_keyed_state(("markdown-display", state.entity_id()), cx, move |_, _| {
-            Rc::new(RefCell::new(MarkdownDisplay {
-                state: weak,
-                text: super::Rope::new(),
-                document: MarkdownDocument::default(),
-                index: MarkdownIndex::default(),
-                pending_edit: None,
-                pending_text: None,
-                last_display: None,
-                code_focus: Rc::default(),
-                task_glyphs: Vec::new(),
-                image_root: None,
-                notes: None,
-            }))
+            MarkdownDisplay::new(weak)
         })
         .read(cx)
         .clone()
@@ -977,7 +1143,141 @@ impl EditorDisplayProvider for MarkdownDisplay {
                 new_len,
             });
         }
+        if ropey::extra::esoterica::ropes_are_instances(&self.text, old_text) {
+            self.document.project_edit(text, range, new_len);
+            self.text = text.clone();
+            self.last_display = None;
+        }
+        self.revision = self.revision.wrapping_add(1);
         self.pending_text = Some(text.clone());
+    }
+    fn prepare(&mut self, text: &super::Rope, cx: &mut App) {
+        if !ropey::extra::esoterica::ropes_are_instances(&self.text, text) {
+            // Source mode and external replacements can bypass provider events.
+            // Compare Rope characters without copying the whole document on UI.
+            let edit = rope_edit(&self.text, text);
+            let old = self.text.clone();
+            self.text_changed(&old, text, &edit.range, edit.new_len);
+        }
+        if let Some((revision, snapshot, index, analysis)) = self.ready.take() {
+            if revision == self.revision
+                && ropey::extra::esoterica::ropes_are_instances(&snapshot, text)
+            {
+                if self
+                    .state
+                    .upgrade()
+                    .is_some_and(|state| state.read(cx).is_selecting())
+                {
+                    self.ready = Some((revision, snapshot, index, analysis));
+                    return;
+                }
+                self.accept(snapshot, index, analysis);
+            }
+        }
+        if ropey::extra::esoterica::ropes_are_instances(&self.parsed_text, text)
+            || self.parse_task.is_some()
+        {
+            return;
+        }
+        let weak = self.weak_self.clone();
+        self.parse_task = Some(cx.spawn(async move |cx| {
+            loop {
+                let request = weak.upgrade().and_then(|display| {
+                    let display = display.borrow();
+                    (!ropey::extra::esoterica::ropes_are_instances(
+                        &display.parsed_text,
+                        &display.text,
+                    ))
+                    .then(|| {
+                        (
+                            display.revision,
+                            display.text.clone(),
+                            display.index.clone(),
+                            display.pending_edit.clone(),
+                        )
+                    })
+                });
+                let Some((revision, text, mut index, edit)) = request else {
+                    break;
+                };
+                #[cfg(test)]
+                {
+                    let gate = weak.upgrade().and_then(|display| {
+                        let mut display = display.borrow_mut();
+                        display.parse_counts.0 += 1;
+                        display.parse_gate.take()
+                    });
+                    if let Some(gate) = gate {
+                        let _ = gate.recv().await;
+                    }
+                }
+                let snapshot = text.clone();
+                let result = cx
+                    .background_executor()
+                    .spawn(async move {
+                        let options = crate::text::advanced::parse_options();
+                        if let Some(reparsed) = edit.and_then(|edit| {
+                            index.reparse(
+                                snapshot.len(),
+                                &edit,
+                                |range| snapshot.slice(range).to_string(),
+                                &options,
+                            )
+                        }) {
+                            return (index, Analysis::Partial(reparsed));
+                        }
+                        let source = snapshot.to_string();
+                        let root = crate::text::wiki::parse(&source, &options).ok();
+                        let index = root
+                            .as_ref()
+                            .map(|root| MarkdownIndex::new(&source, root))
+                            .unwrap_or_default();
+                        (index, Analysis::Full(source, root))
+                    })
+                    .await;
+                let keep_running = cx.update(|cx| {
+                    let Some(display) = weak.upgrade() else {
+                        return false;
+                    };
+                    let mut display = display.borrow_mut();
+                    let Some(state) = display.state.upgrade() else {
+                        return false;
+                    };
+                    // Check both the provider generation and the authoritative
+                    // editor Rope: the editor may change before the next frame.
+                    if display.revision == revision
+                        && ropey::extra::esoterica::ropes_are_instances(
+                            state.read(cx).text(),
+                            &text,
+                        )
+                        && ropey::extra::esoterica::ropes_are_instances(&display.text, &text)
+                    {
+                        #[cfg(test)]
+                        {
+                            display.parse_counts.1 += 1;
+                        }
+                        if state.read(cx).is_selecting() {
+                            display.ready = Some((revision, text, result.0, result.1));
+                        } else {
+                            display.accept(text, result.0, result.1);
+                        }
+                        state.update(cx, |_, cx| cx.notify());
+                    } else {
+                        #[cfg(test)]
+                        {
+                            display.parse_counts.2 += 1;
+                        }
+                    }
+                    display.revision != revision
+                });
+                if !keep_running {
+                    break;
+                }
+            }
+            if let Some(display) = weak.upgrade() {
+                display.borrow_mut().parse_task = None;
+            }
+        }));
     }
     fn link_handler(&self) -> Option<Rc<dyn Fn(&SharedString, &mut Window, &mut App)>> {
         let notes = self.notes.clone();
@@ -1008,7 +1308,10 @@ impl EditorDisplayProvider for MarkdownDisplay {
         cx: &App,
     ) -> EditorDisplay {
         #[cfg(test)]
-        tests::LAST_CODE_FOCUS.with(|last| *last.borrow_mut() = Some(self.code_focus.clone()));
+        {
+            tests::LAST_CODE_FOCUS.with(|last| *last.borrow_mut() = Some(self.code_focus.clone()));
+            tests::LAST_DISPLAY.with(|last| *last.borrow_mut() = self.weak_self.clone());
+        }
         let unchanged = ropey::extra::esoterica::ropes_are_instances(&self.text, text);
         if unchanged
             && self
@@ -1021,62 +1324,6 @@ impl EditorDisplayProvider for MarkdownDisplay {
             // revealing syntax here would move the text beneath the pointer.
             return display.clone();
         }
-        if !unchanged {
-            // Preserve the identity of a fence edited through its nested editor.
-            // Exact-source reuse handles other blocks; this narrower mapping
-            // also survives a content edit without remounting the active editor.
-            let edited_code = self.pending_edit.as_ref().and_then(|edit| {
-                self.document.blocks.iter().find_map(|block| {
-                    let code = block.code.as_ref()?;
-                    (edit.range.start >= code.content.start && edit.range.end <= code.content.end)
-                        .then(|| {
-                            (
-                                block.id,
-                                block.range.start,
-                                block.range.end.checked_add_signed(
-                                    edit.new_len as isize - edit.range.len() as isize,
-                                ),
-                            )
-                        })
-                })
-            });
-            let reparsed = self
-                .pending_edit
-                .as_ref()
-                .filter(|_| {
-                    self.pending_text.as_ref().is_some_and(|pending| {
-                        ropey::extra::esoterica::ropes_are_instances(pending, text)
-                    })
-                })
-                .and_then(|edit| {
-                    self.index.reparse(
-                        text.len(),
-                        edit,
-                        |range| text.slice(range).to_string(),
-                        &crate::text::advanced::parse_options(),
-                    )
-                });
-            if let Some(reparsed) = reparsed {
-                self.document.splice(reparsed);
-            } else {
-                let (mut document, index) = MarkdownDocument::parse_indexed(&text.to_string());
-                document.reuse_blocks(self.document.blocks.iter());
-                self.document = document;
-                self.index = index;
-            }
-            if let Some((id, start, Some(end))) = edited_code
-                && let Some(block) = self
-                    .document
-                    .blocks
-                    .iter_mut()
-                    .find(|block| block.code.is_some() && block.range == (start..end))
-            {
-                block.id = id;
-            }
-            self.text = text.clone();
-        }
-        self.pending_edit = None;
-        self.pending_text = None;
         let active = focused || !selection.is_empty();
         self.task_glyphs = self
             .document
@@ -1279,6 +1526,7 @@ mod tests {
     use gpui::{AppContext, Context, Render, TestAppContext, VisualTestContext, point};
 
     thread_local! {
+        pub(super) static LAST_DISPLAY: RefCell<Weak<RefCell<MarkdownDisplay>>> = const { RefCell::new(Weak::new()) };
         pub(super) static LAST_CODE_FOCUS: RefCell<Option<Rc<RefCell<code_editor::CodeFocus>>>> = const { RefCell::new(None) };
     }
 
@@ -1336,6 +1584,397 @@ mod tests {
         cx.run_until_parked();
         cx.update(|window, cx| window.draw(cx).clear());
         (content, state, cx)
+    }
+
+    fn assert_current_analysis(display: &MarkdownDisplay, source: &str) {
+        assert_eq!(display.parsed_text.to_string(), source);
+        let expected = MarkdownDocument::parse(source);
+        assert_eq!(display.document.links, expected.links);
+        assert_eq!(
+            display
+                .document
+                .replacements(&(source.len()..source.len()), false),
+            expected.replacements(&(source.len()..source.len()), false)
+        );
+        assert_eq!(display.document.blocks.len(), expected.blocks.len());
+        for (actual, expected) in display.document.blocks.iter().zip(&expected.blocks) {
+            assert_eq!(actual.range, expected.range);
+            assert_eq!(actual.source, expected.source);
+            assert_eq!(
+                actual.code.as_ref().map(|code| (&code.content, &code.code)),
+                expected
+                    .code
+                    .as_ref()
+                    .map(|code| (&code.content, &code.code))
+            );
+        }
+        assert_eq!(
+            display
+                .document
+                .tasks
+                .iter()
+                .map(|task| (&task.marker, task.checked))
+                .collect::<Vec<_>>(),
+            expected
+                .tasks
+                .iter()
+                .map(|task| (&task.marker, task.checked))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn rope_edit_keeps_utf8_boundaries_and_minimal_replacement() {
+        for (old, new) in [
+            ("niño 世界 &amp;", "niña 世界 &amp;"),
+            ("", "中"),
+            ("é中", ""),
+            ("same", "same"),
+            ("**abc** suffix", "**a中bc** suffix"),
+        ] {
+            let old_rope = super::super::Rope::from(old);
+            let new_rope = super::super::Rope::from(new);
+            let edit = rope_edit(&old_rope, &new_rope);
+            let mut reconstructed = old.to_string();
+            reconstructed.replace_range(
+                edit.range.clone(),
+                &new[edit.range.start..edit.range.start + edit.new_len],
+            );
+            assert_eq!(reconstructed, new);
+        }
+    }
+
+    #[test]
+    fn provisional_projection_shifts_cached_blocks_and_invalidates_dirty_tokens() {
+        let source =
+            "**niño** &amp; suffix\n\n| Header |\n| --- |\n| cell |\n\n```rust\nlet x = 1;\n```";
+        let mut document = MarkdownDocument::parse(source);
+        let blocks = document
+            .blocks
+            .iter()
+            .map(|block| (block.id, block.range.clone(), block.cache.clone()))
+            .collect::<Vec<_>>();
+        let offset = source.find("niño").unwrap();
+        let mut updated = source.to_string();
+        updated.insert_str(offset, "中");
+        document.project_edit(
+            &super::super::Rope::from(updated.as_str()),
+            &(offset..offset),
+            "中".len(),
+        );
+        assert!(!document.markup.iter().any(|markup| markup.range.start == 0));
+        for (block, (id, old_range, cache)) in document.blocks.iter().zip(blocks) {
+            assert_eq!(block.id, id);
+            assert_eq!(block.range, old_range.start + 3..old_range.end + 3);
+            assert!(Rc::ptr_eq(&block.cache, &cache));
+        }
+        let code = document
+            .blocks
+            .iter()
+            .find(|block| block.code.is_some())
+            .unwrap();
+        let id = code.id;
+        let offset = code.code.as_ref().unwrap().content.start;
+        updated.insert_str(offset, "// é\n");
+        document.project_edit(
+            &super::super::Rope::from(updated.as_str()),
+            &(offset..offset),
+            "// é\n".len(),
+        );
+        let code = document
+            .blocks
+            .iter()
+            .find(|block| block.id == id)
+            .unwrap()
+            .code
+            .as_ref()
+            .unwrap();
+        assert!(code.code.starts_with("// é\n"));
+        assert_eq!(&updated[code.content.clone()], "// é\nlet x = 1;\n");
+    }
+
+    #[gpui::test]
+    fn background_analysis_coalesces_rapid_edits_and_rejects_stale_results(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(crate::init);
+        let source = (0..64).map(|i| format!("## Section {i}\n\n| Col | Value |\n| --- | --- |\n| niño | 世界 &amp; |\n\n```typescript\nconst v{i} = {i};\n```\n\n[link][ref]\n\n")).collect::<String>() + "[ref]: https://example.com\n\nTail";
+        let (_, state, cx) = editor(cx, &source);
+        redraw(cx);
+        let display = LAST_DISPLAY.with(|last| last.borrow().upgrade().unwrap());
+        assert_current_analysis(&display.borrow(), &source);
+        let counts = display.borrow().parse_counts;
+        let ids = display
+            .borrow()
+            .document
+            .blocks
+            .iter()
+            .map(|block| block.id)
+            .collect::<Vec<_>>();
+        let (tx, rx) = crate::async_util::unbounded();
+        display.borrow_mut().parse_gate = Some(rx);
+        cx.update(|window, cx| {
+            state.update(cx, |state, cx| {
+                let end = state.text().len();
+                state.set_selected_range(end..end, cx);
+                state.focus(window, cx);
+                state.replace_text_in_range(None, "a", window, cx);
+            })
+        });
+        redraw(cx); // The first snapshot is now held at the parser gate.
+        let mut expected = source.clone() + "a";
+        for character in "niño 世界 **bold** &amp;".chars() {
+            let text = character.to_string();
+            cx.update(|window, cx| {
+                state.update(cx, |state, cx| {
+                    state.replace_text_in_range(None, &text, window, cx)
+                });
+                window.draw(cx).clear();
+            });
+            expected.push(character);
+        }
+        {
+            let display = display.borrow();
+            assert_eq!(display.parse_counts, (counts.0 + 1, counts.1, counts.2));
+            assert_eq!(
+                display.parsed_text.to_string(),
+                source,
+                "no synchronous parser on input/layout"
+            );
+            assert_eq!(display.text.to_string(), expected);
+            assert_eq!(
+                display
+                    .document
+                    .blocks
+                    .iter()
+                    .map(|block| block.id)
+                    .collect::<Vec<_>>(),
+                ids
+            );
+        }
+        tx.try_send(()).unwrap();
+        redraw(cx);
+        redraw(cx);
+        assert_current_analysis(&display.borrow(), &expected);
+        assert_eq!(
+            display.borrow().parse_counts,
+            (counts.0 + 2, counts.1 + 1, counts.2 + 1)
+        );
+    }
+
+    #[gpui::test]
+    fn stale_analysis_cannot_replace_a_new_source_mode_document(cx: &mut TestAppContext) {
+        cx.update(crate::init);
+        let source = "# Old\n\n| H |\n| --- |\n| é |\n\n```rust\nlet x = 1;\n```\n\n[ref]: https://old.example\n\nTail";
+        let (view, state, cx) = editor(cx, source);
+        redraw(cx);
+        let display = LAST_DISPLAY.with(|last| last.borrow().upgrade().unwrap());
+        let (tx, rx) = crate::async_util::unbounded();
+        display.borrow_mut().parse_gate = Some(rx);
+        cx.update(|window, cx| {
+            state.update(cx, |state, cx| {
+                let end = state.text().len();
+                state.set_selected_range(end..end, cx);
+                state.replace_text_in_range(None, " pending", window, cx);
+            })
+        });
+        redraw(cx);
+        view.update(cx, |view, cx| {
+            view.mode = MarkdownMode::Source;
+            cx.notify();
+        });
+        redraw(cx);
+        let new_source =
+            "# New 世界\n\n[link][ref]\n\n[ref]: https://new.example\n\n```rust\nnew();\n```";
+        cx.update(|window, cx| {
+            state.update(cx, |state, cx| state.set_value(new_source, window, cx))
+        });
+        tx.try_send(()).unwrap();
+        redraw(cx);
+        assert_eq!(
+            state.read_with(cx, |state, _| state.value()).as_ref(),
+            new_source
+        );
+        assert_ne!(
+            display.borrow().parsed_text.to_string(),
+            format!("{source} pending")
+        );
+        for mode in [MarkdownMode::Preview, MarkdownMode::LivePreview] {
+            view.update(cx, |view, cx| {
+                view.mode = mode;
+                cx.notify();
+            });
+            redraw(cx);
+            redraw(cx);
+        }
+        assert_current_analysis(&display.borrow(), new_source);
+        assert!(
+            display
+                .borrow()
+                .document
+                .links
+                .iter()
+                .any(|(_, url)| url.as_ref() == "https://new.example")
+        );
+        assert!(display.borrow().parse_counts.2 >= 1);
+    }
+
+    #[gpui::test]
+    fn background_analysis_preserves_unicode_composition_and_history(cx: &mut TestAppContext) {
+        cx.update(crate::init);
+        let source = "| H |\n| --- |\n| é |\n\n[ref]: https://example.com\n\nTail ";
+        let (_, state, cx) = editor(cx, source);
+        redraw(cx);
+        let display = LAST_DISPLAY.with(|last| last.borrow().upgrade().unwrap());
+        cx.update(|window, cx| {
+            state.update(cx, |state, cx| {
+                let end = state.text().len();
+                state.set_selected_range(end..end, cx);
+                state.focus(window, cx);
+                state.replace_and_mark_text_in_range(None, "中", Some(1..1), window, cx);
+            })
+        });
+        redraw(cx);
+        cx.update(|window, cx| {
+            state.update(cx, |state, cx| {
+                assert!(state.marked_text_range(window, cx).is_some());
+                state.replace_and_mark_text_in_range(None, "世界", Some(2..2), window, cx);
+            })
+        });
+        redraw(cx);
+        cx.update(|window, cx| {
+            state.update(cx, |state, cx| {
+                assert!(state.marked_text_range(window, cx).is_some());
+                state.replace_text_in_range(None, "世界", window, cx);
+            })
+        });
+        redraw(cx);
+        assert_current_analysis(&display.borrow(), &format!("{source}世界"));
+        cx.dispatch_action(super::super::Undo);
+        redraw(cx);
+        assert_eq!(
+            state.read_with(cx, |state, _| state.value()).as_ref(),
+            source
+        );
+        cx.dispatch_action(super::super::Redo);
+        redraw(cx);
+        assert_current_analysis(&display.borrow(), &format!("{source}世界"));
+    }
+
+    #[gpui::test]
+    fn partial_background_edits_match_full_analysis_for_tables_and_fences(cx: &mut TestAppContext) {
+        cx.update(crate::init);
+        let source = "intro **bold**\n\n| Header | Value |\n| --- | --- |\n| niño | 世界 |\n\n```rust\nlet x = 1;\n```\n\nend";
+        let (_, state, cx) = editor(cx, source);
+        redraw(cx);
+        let display = LAST_DISPLAY.with(|last| last.borrow().upgrade().unwrap());
+        for (needle, replacement) in [
+            ("niño", "é中"),
+            ("--- |", "---: |"),
+            ("let x = 1;", "// é\nlet x = 2;"),
+            ("```\n\nend", "\n\nend"),
+            ("**bold**", "_new_"),
+        ] {
+            cx.update(|window, cx| {
+                state.update(cx, |state, cx| state.set_value(source, window, cx))
+            });
+            redraw(cx);
+            let start = source.find(needle).unwrap();
+            let mut expected = source.to_string();
+            expected.replace_range(start..start + needle.len(), replacement);
+            cx.update(|window, cx| {
+                state.update(cx, |state, cx| {
+                    state.set_selected_range(start..start + needle.len(), cx);
+                    state.focus(window, cx);
+                    state.replace_text_in_range(None, replacement, window, cx);
+                });
+                assert_eq!(display.borrow().parsed_text.to_string(), source);
+                assert_eq!(
+                    state.read(cx).selected_range(),
+                    start + replacement.len()..start + replacement.len()
+                );
+            });
+            redraw(cx);
+            redraw(cx);
+            assert_current_analysis(&display.borrow(), &expected);
+        }
+    }
+
+    #[gpui::test]
+    fn retired_presentation_does_not_keep_its_parser_job_alive(cx: &mut TestAppContext) {
+        cx.update(crate::init);
+        let (_, state, cx) = editor(cx, "**niño**\n\n[ref]: https://example.com");
+        let display = MarkdownDisplay::new(state.downgrade());
+        let weak = Rc::downgrade(&display);
+        let (tx, rx) = crate::async_util::unbounded();
+        display.borrow_mut().parse_gate = Some(rx);
+        cx.update(|_, cx| {
+            let text = state.read(cx).text().clone();
+            display.borrow_mut().prepare(&text, cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(display.borrow().parse_counts.0, 1);
+        drop(display);
+        assert!(weak.upgrade().is_none());
+        let _ = tx.try_send(());
+        cx.run_until_parked();
+        assert!(weak.upgrade().is_none());
+        assert_eq!(
+            state.read_with(cx, |state, _| state.value()).as_ref(),
+            "**niño**\n\n[ref]: https://example.com"
+        );
+    }
+
+    #[gpui::test]
+    fn background_publication_waits_for_drag_release(cx: &mut TestAppContext) {
+        cx.update(crate::init);
+        let source = "**bold** text\n\n[ref]: https://example.com\n\nTail";
+        let (_, state, cx) = editor(cx, source);
+        redraw(cx);
+        let display = LAST_DISPLAY.with(|last| last.borrow().upgrade().unwrap());
+        let (tx, rx) = crate::async_util::unbounded();
+        display.borrow_mut().parse_gate = Some(rx);
+        cx.update(|window, cx| {
+            state.update(cx, |state, cx| {
+                let end = state.text().len();
+                state.set_selected_range(end..end, cx);
+                state.focus(window, cx);
+                state.replace_text_in_range(None, " é", window, cx);
+            })
+        });
+        redraw(cx);
+        let bounds = state
+            .read_with(cx, |state, _| state.range_to_bounds(&(3..4)))
+            .unwrap();
+        cx.simulate_mouse_down(
+            bounds.center(),
+            MouseButton::Left,
+            gpui::Modifiers::default(),
+        );
+        redraw(cx);
+        let replacements = display
+            .borrow()
+            .last_display
+            .as_ref()
+            .unwrap()
+            .replacements
+            .clone();
+        tx.try_send(()).unwrap();
+        redraw(cx);
+        assert!(display.borrow().ready.is_some());
+        assert_eq!(display.borrow().parsed_text.to_string(), source);
+        assert_eq!(
+            display.borrow().last_display.as_ref().unwrap().replacements,
+            replacements
+        );
+        cx.simulate_mouse_up(
+            bounds.center(),
+            MouseButton::Left,
+            gpui::Modifiers::default(),
+        );
+        redraw(cx);
+        assert!(display.borrow().ready.is_none());
+        assert_current_analysis(&display.borrow(), &format!("{source} é"));
     }
 
     #[gpui::test]

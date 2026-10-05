@@ -1801,15 +1801,13 @@ impl<M: InputModeKind> Element for TextElement<M> {
         } else {
             state.selected_range()
         };
+        let focused = state.focus_handle.is_focused(window);
         self.display = provider
             .map(|provider| {
-                provider.borrow_mut().display(
-                    &text,
-                    selection,
-                    state.focus_handle.is_focused(window),
-                    window,
-                    cx,
-                )
+                provider.borrow_mut().prepare(&text, cx);
+                provider
+                    .borrow_mut()
+                    .display(&text, selection, focused, window, cx)
             })
             .unwrap_or_default();
         let line_height = window.line_height();

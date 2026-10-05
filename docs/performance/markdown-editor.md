@@ -39,6 +39,42 @@ The public `SyntaxHighlighter::new`/`update` APIs remain synchronous for direct
 callers. Framework rendering uses the asynchronous adapters. Existing injection
 budgets and folding/highlight functionality are retained.
 
+## Markdown analysis during editing
+
+The Live Preview provider no longer calls `wiki::parse`, `to_mdast`, or
+`MarkdownIndex::reparse` from `display`/`prepaint`. Its optional `prepare` hook
+schedules a single worker at a time. Each worker reads the newest requested Rope
+snapshot and either reparses the bounded incremental window or performs the safe
+full fallback. Edits arriving during a parse are combined relative to the last
+accepted index; the next worker processes the newest snapshot, rather than one
+job for every queued keystroke.
+
+Global reference/footnote definitions still require full analysis for correctness.
+The stress note has a reference definition near its end, so even unrelated tail
+edits previously entered the synchronous full fallback. That CPU work now runs
+on the background executor; this change does not claim incremental parsing of
+all global dependencies. An already running Markdown parser cannot be interrupted.
+The queue holds one active snapshot and the latest request, with no worker per key.
+
+The authoritative editable source stays in `EditorState`. Read-only parser
+snapshots do not write the document, selection, history, or composition state.
+Foreground source edits shift unaffected token/block/task/link ranges and retain
+cached geometry. Dirty tokens and ordinary rendered blocks show their actual
+source until the accepted analysis arrives. Fenced-code content can be updated
+lexically while keeping the nested editor's stable identity. Unknown replacements
+and edits made in Source mode are compared as Rope characters, without copying
+the entire document to a UI-thread string.
+
+Publication checks the provider revision, current provider Rope, authoritative
+editor Rope, and weak presentation/editor lifetimes. Old results cannot publish
+after rapid edits or a document replacement. A completed result waits until drag
+selection is released, keeping the pointer's presentation stable. UI publication
+converts the accepted AST to presentation metadata and reuses unaffected caches;
+this conversion and layout remain UI work, but Markdown parsing does not.
+
+`EditorDisplayProvider::prepare(&Rope, &mut App)` is an additive, default no-op
+hook. Existing provider implementations and NeverWrite APIs need no changes.
+
 ## Geometry and nested editors
 
 Projection reuses valid measured sizes even for visible blocks. Initial editable
@@ -93,7 +129,7 @@ results. The original note, vault and NeverWrite repository are not modified.
 
 ### Exploratory component comparison
 
-One fresh-process run per revision, `85ed12f1` versus these changes, on the same
+One fresh-process run per revision, `85ed12f1` versus `abf45895`, on the same
 X11/Xvfb setup and repository dev profile (Tree-sitter `opt-level = 3`, version
 0.26.8; ZUI `3151ad1`). Mesa reported DRI3 unavailable. Times below are measured
 inside the component from action handling to its paint callback; mouse/snapshot
@@ -116,3 +152,41 @@ compilation/Live Preview improvement measured here. Background syntax readiness
 is not the endpoint of this measurement. Raw runs are
 `target/markdown-performance/before-sfw560f4` and
 `target/markdown-performance/after-b05bktfl`.
+
+### Second change: separate keyboard events
+
+An additional pair of isolated component runs compares `abf45895` with the
+background Markdown analysis change. Both use the same verified stress-note
+copy, binary harness, repository dev profile, ZUI revision, and X11/Xvfb setup.
+The probe waits two seconds after opening before typing and sends the same
+24-character marker through `xdotool type` with a 15 ms inter-event delay. It
+then waits for a source snapshot containing all characters. Source snapshots,
+Undo/Redo, Home/End, document replacement, and mode transitions passed in both
+runs; the rendered open screenshot was also inspected.
+
+| Operation | Before | After | Reduction |
+| --- | ---: | ---: | ---: |
+| 24 separate keyboard events to verified source snapshot | 2320.6 ms | 391.7 ms | 83.1% |
+
+These are single exploratory runs. The numbers include input pacing and snapshot
+polling and exclude NeverWrite autosave and completion of all background styling.
+They measure input responsiveness, not total Markdown CPU time. Initial Live
+Preview can paint source before parsing completes, so its first-frame time is
+not equivalent to a fully formatted document. The first reading Preview still
+took about 2.6 seconds in the new run and remains a separate cost.
+
+Artifacts: `target/markdown-performance/after-x48lko0_/result.json` and
+`target/markdown-performance/after2-di2iyg03/result.json`, with the shared local
+`probe-typing.py`. They are ignored local artifacts, not repository fixtures.
+NeverWrite integration of the first change independently reported 18.48 s to
+2.458 s for opening, but 12.017 s for typing plus autosave. Integration of this
+second change must measure that remaining operation using NW's original profile;
+component results must not be substituted for it.
+
+Eight additional tests cover bounded/coalesced jobs and obsolete results under
+rapid edits on a document with 64 fences/tables and a global definition, source
+replacement while in Source mode, partial table/fence/Unicode edits against a
+fresh full analysis, retained block caches and code identities, composition with
+Undo/Redo, retired presentations, and publication held until drag release.
+Final library results: base 361 passed / 1 existing ignored; component 469 passed.
+The component also builds with `--no-default-features`.
