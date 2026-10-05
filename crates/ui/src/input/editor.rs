@@ -141,6 +141,9 @@ impl Styled for Editor {
 impl RenderOnce for Editor {
     fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
         if let Some(mode) = self.markdown_mode {
+            // Keep the document's presentation session alive in every mode,
+            // including Source where no display provider is attached.
+            super::markdown::retain_session(&self.state, window, cx);
             if let Some(notes) = self.markdown_notes {
                 super::markdown::set_notes(&self.state, notes, window, cx);
             }

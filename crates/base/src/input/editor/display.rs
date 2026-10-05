@@ -25,6 +25,21 @@ pub struct EditorDisplayBlock {
 pub struct EditorDisplayBlockCache {
     pub(crate) key: Option<(Pixels, Font, Pixels, Pixels)>,
     pub(crate) size: Size<Pixels>,
+    height_hint: Option<Rc<dyn Fn(Pixels) -> Pixels>>,
+}
+
+impl EditorDisplayBlockCache {
+    /// Supply a cheap initial height for blocks whose geometry is known without
+    /// constructing their view. Visible layout replaces this hint with a measurement.
+    pub fn set_height_hint(&mut self, hint: impl Fn(Pixels) -> Pixels + 'static) {
+        self.height_hint = Some(Rc::new(hint));
+    }
+
+    pub(crate) fn initial_size(&self, width: Pixels, line_height: Pixels) -> Option<Size<Pixels>> {
+        self.height_hint
+            .as_ref()
+            .map(|hint| gpui::size(width, hint(line_height)))
+    }
 }
 
 /// Application-owned presentation of the editor's source.

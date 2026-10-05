@@ -7,7 +7,12 @@
 //! revealed as source with Escape, a click on the header, or by leaving the
 //! code past the start or end of the document.
 
-use std::{cell::RefCell, ops::Range, rc::Rc};
+use std::{
+    cell::RefCell,
+    collections::{HashMap, HashSet},
+    ops::Range,
+    rc::Rc,
+};
 
 use gpui::{
     AnyElement, App, AppContext as _, Bounds, Context, Entity, EntityId, EntityInputHandler as _,
@@ -84,9 +89,35 @@ fn lines(code: &str) -> String {
 pub(super) struct CodeFocus {
     revealed: Option<usize>,
     pending: Option<(usize, usize)>,
+    // Retain visited editors independently of viewport element-state eviction.
+    editors: HashMap<u64, Entity<CodeEditor>>,
 }
 
 impl CodeFocus {
+    #[cfg(test)]
+    pub(super) fn editor_ids(&self) -> Vec<(u64, EntityId)> {
+        let mut ids = self
+            .editors
+            .iter()
+            .map(|(id, editor)| (*id, editor.entity_id()))
+            .collect::<Vec<_>>();
+        ids.sort_by_key(|(id, _)| *id);
+        ids
+    }
+
+    #[cfg(test)]
+    pub(super) fn first_editor(&self, cx: &App) -> Option<Entity<EditorState>> {
+        self.editors
+            .iter()
+            .min_by_key(|(id, _)| *id)
+            .map(|(_, editor)| editor)
+            .map(|editor| editor.read(cx).editor.clone())
+    }
+
+    pub(super) fn retain_editors(&mut self, ids: &HashSet<u64>) {
+        self.editors.retain(|id, _| ids.contains(id));
+    }
+
     /// Whether a fenced block shows its Markdown source for the document
     /// `selection`. A focused caret entering the block moves into its nested
     /// editor instead, unless the source was revealed explicitly.
@@ -207,16 +238,19 @@ impl CodeEditor {
                 .update(cx, |editor, cx| editor.set_highlighter(lang, cx));
         }
         self.editor.update(cx, |editor, cx| {
-            if editor.value() == code.code {
+            if editor.text().slice(0..editor.text().len()) == code.code.as_ref() {
                 return;
             }
             let selection = editor.selected_range();
             editor.set_value(code.code.clone(), window, cx);
-            let mut offset = selection.start.min(code.code.len());
-            while !code.code.is_char_boundary(offset) {
-                offset -= 1;
-            }
-            editor.set_selected_range(offset..offset, cx);
+            let clamp = |offset: usize| {
+                let mut offset = offset.min(code.code.len());
+                while !code.code.is_char_boundary(offset) {
+                    offset -= 1;
+                }
+                offset
+            };
+            editor.set_selected_range(clamp(selection.start)..clamp(selection.end), cx);
         });
     }
 
@@ -244,7 +278,8 @@ impl CodeEditor {
         let replaced = document.update(cx, |document, cx| {
             let previous = lines(&previous);
             let end = start + previous.len();
-            if document.value().get(start..end) != Some(previous.as_str()) {
+            if end > document.text().len() || document.text().slice(start..end) != previous.as_str()
+            {
                 // The document changed underneath; the next render resyncs.
                 return false;
             }
@@ -264,6 +299,7 @@ impl CodeEditor {
 pub(super) struct EditableCode {
     pub(super) document: WeakEntity<EditorState>,
     pub(super) document_id: EntityId,
+    pub(super) id: u64,
     pub(super) code: FencedCode,
     /// The block's complete source lines, fences included.
     pub(super) lines: Range<usize>,
@@ -271,6 +307,14 @@ pub(super) struct EditableCode {
 }
 
 impl EditableCode {
+    pub(super) fn height_hint(&self, window: &Window, cx: &App) -> Pixels {
+        let line_height = code_block::line_height(cx);
+        let rows = self.code.code.split('\n').count();
+        (line_height * rows as f32 + px(EDITOR_PADDING_Y * 2.)).ceil()
+            + px(code_block::HEADER_HEIGHT + 2.)
+            + window.rem_size() * 0.5
+    }
+
     /// Leave the nested editor, placing the document caret at `offset`, or
     /// reveal the block's source at `fallback` when `offset` is unavailable.
     fn exit(&self, offset: Option<usize>, fallback: usize, window: &mut Window, cx: &mut App) {
@@ -289,19 +333,23 @@ impl EditableCode {
 
     pub(super) fn render(self: &Rc<Self>, window: &mut Window, cx: &mut App) -> AnyElement {
         let code = &self.code;
-        let editor = window.use_keyed_state(
-            SharedString::from(format!(
-                "markdown-code-editor-{:?}-{}",
-                self.document_id, code.ordinal
-            )),
-            cx,
-            {
-                let document = self.document.clone();
-                let lang = code.lang.clone();
-                let text = code.code.clone();
-                move |window, cx| CodeEditor::new(document, lang, text, window, cx)
-            },
-        );
+        let editor = self
+            .focus
+            .borrow_mut()
+            .editors
+            .entry(self.id)
+            .or_insert_with(|| {
+                cx.new(|cx| {
+                    CodeEditor::new(
+                        self.document.clone(),
+                        code.lang.clone(),
+                        code.code.clone(),
+                        window,
+                        cx,
+                    )
+                })
+            })
+            .clone();
         editor.update(cx, |editor, cx| editor.sync(code, window, cx));
         let nested = editor.read(cx).editor.clone();
         #[cfg(test)]

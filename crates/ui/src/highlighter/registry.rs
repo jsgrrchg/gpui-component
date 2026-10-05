@@ -5,7 +5,10 @@ use serde_repr::{Deserialize_repr, Serialize_repr};
 use std::{
     collections::HashMap,
     ops::Deref,
-    sync::{Arc, LazyLock, Mutex},
+    sync::{
+        Arc, LazyLock, Mutex, OnceLock,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 
 use crate::{
@@ -491,51 +494,139 @@ impl gpui_base::input::HighlightStyleResolver for HighlightTheme {
     }
 }
 
+/// An immutable configuration snapshot. Compilations are shared by identical
+/// configurations, never just by the display name of a language.
+pub(crate) struct RegisteredLanguage {
+    pub(crate) config: LanguageConfig,
+    pub(crate) queries: OnceLock<Result<Arc<super::highlighter::CompiledQueries>, String>>,
+    pub(crate) injection_highlights: OnceLock<Result<Arc<tree_sitter::Query>, String>>,
+}
+
+impl RegisteredLanguage {
+    fn new(config: LanguageConfig) -> Self {
+        Self {
+            config,
+            queries: OnceLock::new(),
+            injection_highlights: OnceLock::new(),
+        }
+    }
+
+    pub(crate) fn highlight_query(&self) -> Option<Arc<tree_sitter::Query>> {
+        self.injection_highlights
+            .get_or_init(|| {
+                tree_sitter::Query::new(
+                    self.config.language.as_ref().ok_or("no grammar")?,
+                    &self.config.highlights,
+                )
+                .map(Arc::new)
+                .map_err(|error| error.to_string())
+            })
+            .as_ref()
+            .ok()
+            .cloned()
+    }
+}
+
 /// Registry for code highlighter languages.
 pub struct LanguageRegistry {
-    languages: Mutex<HashMap<SharedString, LanguageConfig>>,
+    languages: Mutex<HashMap<SharedString, Arc<RegisteredLanguage>>>,
+    revision: AtomicU64,
 }
 
 impl LanguageRegistry {
-    /// Returns the singleton instance of the `LanguageRegistry` with default languages and themes.
+    /// Returns the singleton instance with the default languages.
     pub fn singleton() -> &'static LazyLock<LanguageRegistry> {
         static INSTANCE: LazyLock<LanguageRegistry> = LazyLock::new(|| LanguageRegistry {
             languages: Mutex::new(
                 languages::Language::all()
-                    .map(|language| (language.name().into(), language.config()))
+                    .map(|language| {
+                        (
+                            language.name().into(),
+                            Arc::new(RegisteredLanguage::new(language.config())),
+                        )
+                    })
                     .collect(),
             ),
+            revision: AtomicU64::new(0),
         });
         &INSTANCE
     }
 
-    /// Registers a new language configuration to the registry.
+    /// Register a configuration or replace an existing one. Existing snapshots
+    /// stay immutable; consumers use the revision to reject obsolete work.
     pub fn register(&self, lang: &str, config: &LanguageConfig) {
-        self.languages
-            .lock()
-            .unwrap()
-            .insert(lang.to_string().into(), config.clone());
+        let mut languages = self.languages.lock().unwrap();
+        if languages
+            .get(lang)
+            .is_some_and(|entry| &entry.config == config)
+        {
+            return;
+        }
+        let entry = languages
+            .values()
+            .find(|entry| &entry.config == config)
+            .cloned()
+            .unwrap_or_else(|| Arc::new(RegisteredLanguage::new(config.clone())));
+        languages.insert(lang.to_string().into(), entry);
+        self.revision.fetch_add(1, Ordering::Release);
     }
 
-    /// Returns a list of all registered language names.
-    pub fn languages(&self) -> Vec<SharedString> {
-        self.languages.lock().unwrap().keys().cloned().collect()
+    pub(crate) fn revision(&self) -> u64 {
+        self.revision.load(Ordering::Acquire)
     }
 
-    /// Returns the language configuration for the given language name.
-    pub fn language(&self, name: &str) -> Option<LanguageConfig> {
-        // Try to get by name first, there may have a custom language registered
-        // Then try to get built-in language to support short language names, e.g. "js" for "javascript"
+    pub(crate) fn snapshot(&self, name: &str) -> Option<Arc<RegisteredLanguage>> {
         let languages = self.languages.lock().unwrap();
         languages.get(name).cloned().or_else(|| {
             Language::from_name(name).and_then(|language| languages.get(language.name()).cloned())
         })
+    }
+
+    pub fn languages(&self) -> Vec<SharedString> {
+        self.languages.lock().unwrap().keys().cloned().collect()
+    }
+
+    /// Resolve explicitly registered names before built-in aliases.
+    pub fn language(&self, name: &str) -> Option<LanguageConfig> {
+        self.snapshot(name).map(|entry| entry.config.clone())
     }
 }
 
 #[cfg(test)]
 mod tests {
     use crate::highlighter::LanguageConfig;
+
+    #[cfg(feature = "tree-sitter-javascript")]
+    #[test]
+    fn builtin_aliases_follow_replacements_and_identical_registration_is_a_noop() {
+        use super::*;
+        let config = Language::JavaScript.config();
+        let registry = LanguageRegistry {
+            languages: Mutex::new(HashMap::from([(
+                config.name.clone(),
+                Arc::new(RegisteredLanguage::new(config.clone())),
+            )])),
+            revision: AtomicU64::new(0),
+        };
+        let old = registry.snapshot("js").unwrap();
+        registry.register("javascript", &config);
+        assert_eq!(registry.revision(), 0);
+        let mut replacement = config.clone();
+        replacement.locals = "".into();
+        replacement.highlights = "(identifier) @variable".into();
+        registry.register("javascript", &replacement);
+        let current = registry.snapshot("js").unwrap();
+        assert!(!Arc::ptr_eq(&old, &current));
+        assert!(Arc::ptr_eq(
+            &current,
+            &registry.snapshot("javascript").unwrap()
+        ));
+        assert_eq!(registry.language("js").unwrap(), replacement);
+        assert_eq!(old.config, config, "in-flight snapshots stay immutable");
+        registry.register("js", &config);
+        assert_eq!(registry.language("js").unwrap(), config);
+        assert_eq!(registry.language("javascript").unwrap(), replacement);
+    }
 
     #[test]
     fn test_registry() {

@@ -1814,13 +1814,6 @@ impl<M: InputModeKind> Element for TextElement<M> {
             .unwrap_or_default();
         let line_height = window.line_height();
         let block_width = (bounds.size.width - line_number_width - RIGHT_MARGIN).max(px(1.));
-        let previous_visible = self
-            .state
-            .read(cx)
-            .last_layout
-            .as_ref()
-            .map(|layout| layout.visible_buffer_lines.clone())
-            .unwrap_or_default();
         let block_key = (block_width, style.font(), text_size, line_height);
         let mut block_elements = Vec::new();
         let mut block_layouts = Vec::new();
@@ -1828,13 +1821,18 @@ impl<M: InputModeKind> Element for TextElement<M> {
             let first_line = text.offset_to_point(block.range.start).row;
             let last_line = text.offset_to_point(block.range.end.saturating_sub(1)).row;
             let cached = block.cache.borrow();
-            let reuse = cached.key.as_ref() == Some(&block_key)
-                && previous_visible.binary_search(&first_line).is_err();
+            let reuse = cached.key.as_ref() == Some(&block_key);
+            let initial_size = cached.initial_size(block_width, line_height);
             let cached_size = cached.size;
             drop(cached);
             let mut element = None;
             let measured = if reuse {
                 cached_size
+            } else if let Some(initial_size) = initial_size {
+                let mut cache = block.cache.borrow_mut();
+                cache.key = Some(block_key.clone());
+                cache.size = initial_size;
+                initial_size
             } else {
                 let mut view = (block.render)(window, cx);
                 let measured = view.layout_as_root(

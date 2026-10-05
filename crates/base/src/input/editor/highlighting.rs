@@ -29,6 +29,11 @@ impl HighlightStyleResolver for NoHighlightStyles {
 pub trait InputHighlighter {
     fn language(&self) -> SharedString;
 
+    /// Whether an external configuration change requires a fresh update.
+    fn needs_update(&self) -> bool {
+        false
+    }
+
     fn update(
         &mut self,
         edit: Option<InputEdit>,

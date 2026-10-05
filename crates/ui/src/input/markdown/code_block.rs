@@ -23,7 +23,7 @@ use crate::{
 };
 
 const NAME: &str = "markdown-editor-code-block";
-const HEADER_HEIGHT: f32 = 28.;
+pub(super) const HEADER_HEIGHT: f32 = 28.;
 const PADDING_X: f32 = 12.;
 const PADDING_Y: f32 = 10.;
 /// Zeron's 18px rows at its 12.5px default code size.
@@ -100,8 +100,10 @@ impl MarkdownPlugin for CodeBlockPlugin {
             .clone();
         let fit = window.use_keyed_state(SharedString::from(format!("{id}-fit")), cx, |_, _| false);
         let fit_content = *fit.read(cx);
+        let styles = data
+            .block
+            .styles_async(&cx.theme().highlight_theme.clone(), window, cx);
         let theme = cx.theme();
-        let styles = data.block.styles(&theme.highlight_theme);
         let code_size = theme.mono_font_size;
         let lines = div()
             .px(px(PADDING_X))

@@ -186,7 +186,12 @@ impl LayoutMode {
                 folding,
                 ..
             } => {
-                if !update.force && highlighter.borrow().is_some() {
+                if !update.force
+                    && highlighter
+                        .borrow()
+                        .as_ref()
+                        .is_some_and(|inner| !inner.needs_update())
+                {
                     return;
                 }
 

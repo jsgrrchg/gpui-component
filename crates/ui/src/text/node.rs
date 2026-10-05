@@ -1,5 +1,4 @@
 use std::{
-    cell::RefCell,
     collections::HashMap,
     ops::Range,
     sync::{Arc, Mutex},
@@ -18,7 +17,6 @@ use ropey::Rope;
 use crate::{
     ActiveTheme as _, Icon, IconName, StyledExt, h_flex,
     highlighter::{HighlightTheme, LanguageRegistry, SyntaxHighlighter},
-    input::{InputEdit, Point, RopeExt as _},
     scroll::horizontal_scroll_area,
     text::{
         CodeBlockActionsFn, LinkClickHandlerFn, MarkdownExtensions, MarkdownNode,
@@ -32,11 +30,17 @@ use crate::{
     v_flex,
 };
 
+#[cfg(any(test, not(feature = "tree-sitter")))]
+use crate::input::{InputEdit, Point, RopeExt as _};
+#[cfg(any(test, not(feature = "tree-sitter")))]
+use std::cell::RefCell;
+
 use super::{
     SelectionFormat, TableAppearance, TextViewStyle,
     utils::{image_source, list_item_prefix},
 };
 
+#[cfg(any(test, not(feature = "tree-sitter")))]
 thread_local! {
     static CODE_BLOCK_HIGHLIGHTERS: RefCell<HashMap<SharedString, SyntaxHighlighter>> =
         RefCell::new(HashMap::new());
@@ -1162,6 +1166,7 @@ struct CachedCodeBlockStyles {
     /// The active theme used to compute `styles`.
     highlight_theme: Arc<HighlightTheme>,
     styles: Vec<(Range<usize>, HighlightStyle)>,
+    revision: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -1175,6 +1180,24 @@ pub struct CodeBlock {
 impl PartialEq for CodeBlock {
     fn eq(&self, other: &Self) -> bool {
         self.lang == other.lang && self.code() == other.code() && self.span == other.span
+    }
+}
+
+#[cfg(feature = "tree-sitter")]
+struct CodeHighlightJob {
+    task: Option<gpui::Task<()>>,
+    theme: Option<Arc<HighlightTheme>>,
+    revision: u64,
+}
+
+fn highlight_revision() -> u64 {
+    #[cfg(feature = "tree-sitter")]
+    {
+        LanguageRegistry::singleton().revision()
+    }
+    #[cfg(not(feature = "tree-sitter"))]
+    {
+        0
     }
 }
 
@@ -1210,6 +1233,7 @@ impl CodeBlock {
         }
     }
 
+    #[cfg(any(test, not(feature = "tree-sitter")))]
     pub(crate) fn styles(
         &self,
         highlight_theme: &Arc<HighlightTheme>,
@@ -1225,7 +1249,10 @@ impl CodeBlock {
         // Pointer identity is the common render-path fast check. If an
         // equivalent theme is reallocated, adopt its Arc while preserving the
         // computed styles so subsequent renders also use the fast path.
-        if let Some(cached) = styles.as_mut() {
+        if let Some(cached) = styles
+            .as_mut()
+            .filter(|cached| cached.revision == highlight_revision())
+        {
             if Arc::ptr_eq(&cached.highlight_theme, highlight_theme) {
                 return cached.styles.clone();
             }
@@ -1271,8 +1298,119 @@ impl CodeBlock {
         *styles = Some(CachedCodeBlockStyles {
             highlight_theme: highlight_theme.clone(),
             styles: computed_styles.clone(),
+            revision: highlight_revision(),
         });
         computed_styles
+    }
+
+    /// Rendering schedules compilation and parsing without waiting on the UI.
+    #[cfg(feature = "tree-sitter")]
+    pub(crate) fn styles_async(
+        &self,
+        theme: &Arc<HighlightTheme>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Vec<(Range<usize>, HighlightStyle)> {
+        let Some(lang) = &self.lang else {
+            return Vec::new();
+        };
+        let registry = LanguageRegistry::singleton();
+        let revision = registry.revision();
+        if let Ok(cache) = self.styles.lock()
+            && let Some(cached) = cache.as_ref()
+            && cached.revision == revision
+            && cached.highlight_theme.as_ref() == theme.as_ref()
+        {
+            return cached.styles.clone();
+        }
+        let Some(entry) = registry.snapshot(lang) else {
+            return Vec::new();
+        };
+        let job = window.use_keyed_state(
+            SharedString::from(format!("code-highlight-{:p}", Arc::as_ptr(&self.styles))),
+            cx,
+            |_, _| CodeHighlightJob {
+                task: None,
+                theme: None,
+                revision,
+            },
+        );
+        job.update(cx, |job, cx| {
+            if job.task.is_some()
+                && job.revision == revision
+                && job
+                    .theme
+                    .as_ref()
+                    .is_some_and(|current| current.as_ref() == theme.as_ref())
+            {
+                return;
+            }
+            job.task.take();
+            job.revision = revision;
+            job.theme = Some(theme.clone());
+            let theme = theme.clone();
+            let code = self.code();
+            let cache = Arc::downgrade(&self.styles);
+            let entry = entry.clone();
+            let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            job.task = Some(cx.spawn_in(window, async move |entity, cx| {
+                struct CancelOnDrop(Arc<std::sync::atomic::AtomicBool>);
+                impl Drop for CancelOnDrop {
+                    fn drop(&mut self) {
+                        self.0.store(true, std::sync::atomic::Ordering::Relaxed);
+                    }
+                }
+                let _guard = CancelOnDrop(cancel.clone());
+                let worker_theme = theme.clone();
+                let result = cx
+                    .background_executor()
+                    .spawn(async move {
+                        let text = Rope::from_str(&code);
+                        let parsed = SyntaxHighlighter::parse_background(
+                            &entry, &text, None, None, &cancel,
+                        )?;
+                        Some(parsed.styles(&(0..text.len()), worker_theme.as_ref()))
+                    })
+                    .await;
+                if let Some(styles) = result {
+                    let _ = entity.update(cx, |job, cx| {
+                        if job.revision != revision
+                            || highlight_revision() != revision
+                            || job
+                                .theme
+                                .as_ref()
+                                .is_none_or(|current| current.as_ref() != theme.as_ref())
+                        {
+                            if highlight_revision() != revision {
+                                cx.notify();
+                            }
+                            return;
+                        }
+                        if let Some(cache) = cache.upgrade()
+                            && let Ok(mut cache) = cache.lock()
+                        {
+                            *cache = Some(CachedCodeBlockStyles {
+                                highlight_theme: theme,
+                                styles,
+                                revision,
+                            });
+                        }
+                        cx.notify();
+                    });
+                }
+            }));
+        });
+        Vec::new()
+    }
+
+    #[cfg(not(feature = "tree-sitter"))]
+    pub(crate) fn styles_async(
+        &self,
+        theme: &Arc<HighlightTheme>,
+        _: &mut Window,
+        _: &mut App,
+    ) -> Vec<(Range<usize>, HighlightStyle)> {
+        self.styles(theme)
     }
 
     pub(super) fn selected_text(&self) -> String {
@@ -1354,7 +1492,7 @@ impl CodeBlock {
                         "code",
                         self.state.clone(),
                         vec![],
-                        self.styles(&cx.theme().highlight_theme),
+                        self.styles_async(&cx.theme().highlight_theme.clone(), window, cx),
                         node_cx.link_click_handler.clone(),
                     ))
                     .when_some(node_cx.code_block_actions.clone(), |this, actions| {
@@ -3416,6 +3554,10 @@ mod tests {
             let _ = window.draw(cx);
         });
 
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
         let dark_theme = cx.update(|_, cx| cx.theme().highlight_theme.clone());
         let dark_block = view.read_with(cx, |root, cx| {
             let state = root.text_view.read(cx);

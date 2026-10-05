@@ -218,6 +218,9 @@ fn set_task(
             cx,
         );
         state.set_selected_range(selection, cx);
+        // The checkbox has its own dispatch focus. Return it to the document
+        // so Undo/Redo continues to target the edit just performed.
+        state.focus(window, cx);
     });
 }
 
@@ -791,6 +794,11 @@ fn display_state(
         .clone()
 }
 
+/// Keep presentation caches and visited code editors alive through mode changes.
+pub(super) fn retain_session(state: &Entity<EditorState>, window: &mut Window, cx: &mut App) {
+    let _ = display_state(state, window, cx);
+}
+
 pub(super) fn provider(
     state: &Entity<EditorState>,
     window: &mut Window,
@@ -996,9 +1004,11 @@ impl EditorDisplayProvider for MarkdownDisplay {
         text: &super::Rope,
         selection: Range<usize>,
         focused: bool,
-        _: &Window,
+        window: &Window,
         cx: &App,
     ) -> EditorDisplay {
+        #[cfg(test)]
+        tests::LAST_CODE_FOCUS.with(|last| *last.borrow_mut() = Some(self.code_focus.clone()));
         let unchanged = ropey::extra::esoterica::ropes_are_instances(&self.text, text);
         if unchanged
             && self
@@ -1012,6 +1022,24 @@ impl EditorDisplayProvider for MarkdownDisplay {
             return display.clone();
         }
         if !unchanged {
+            // Preserve the identity of a fence edited through its nested editor.
+            // Exact-source reuse handles other blocks; this narrower mapping
+            // also survives a content edit without remounting the active editor.
+            let edited_code = self.pending_edit.as_ref().and_then(|edit| {
+                self.document.blocks.iter().find_map(|block| {
+                    let code = block.code.as_ref()?;
+                    (edit.range.start >= code.content.start && edit.range.end <= code.content.end)
+                        .then(|| {
+                            (
+                                block.id,
+                                block.range.start,
+                                block.range.end.checked_add_signed(
+                                    edit.new_len as isize - edit.range.len() as isize,
+                                ),
+                            )
+                        })
+                })
+            });
             let reparsed = self
                 .pending_edit
                 .as_ref()
@@ -1035,6 +1063,15 @@ impl EditorDisplayProvider for MarkdownDisplay {
                 document.reuse_blocks(self.document.blocks.iter());
                 self.document = document;
                 self.index = index;
+            }
+            if let Some((id, start, Some(end))) = edited_code
+                && let Some(block) = self
+                    .document
+                    .blocks
+                    .iter_mut()
+                    .find(|block| block.code.is_some() && block.range == (start..end))
+            {
+                block.id = id;
             }
             self.text = text.clone();
         }
@@ -1115,6 +1152,15 @@ impl EditorDisplayProvider for MarkdownDisplay {
                 .decorations
                 .push(super::TextDecoration::new(markup.range.clone(), style));
         }
+        self.code_focus.borrow_mut().retain_editors(
+            &self
+                .document
+                .blocks
+                .iter()
+                .filter(|block| block.code.is_some())
+                .map(|block| block.id)
+                .collect(),
+        );
         for block in &self.document.blocks {
             if let Some(code) = &block.code {
                 let inside = touches(&selection, &block.range);
@@ -1128,10 +1174,13 @@ impl EditorDisplayProvider for MarkdownDisplay {
                 let editable = Rc::new(code_editor::EditableCode {
                     document: self.state.clone(),
                     document_id: self.state.entity_id(),
+                    id: block.id,
                     code: code.clone(),
                     lines: block.range.clone(),
                     focus: self.code_focus.clone(),
                 });
+                let height = editable.height_hint(window, cx);
+                block.cache.borrow_mut().set_height_hint(move |_| height);
                 display.blocks.push(EditorDisplayBlock {
                     range: block.range.clone(),
                     cache: block.cache.clone(),
@@ -1229,6 +1278,10 @@ mod tests {
     use super::*;
     use gpui::{AppContext, Context, Render, TestAppContext, VisualTestContext, point};
 
+    thread_local! {
+        pub(super) static LAST_CODE_FOCUS: RefCell<Option<Rc<RefCell<code_editor::CodeFocus>>>> = const { RefCell::new(None) };
+    }
+
     pub(super) struct MarkdownEditorTest {
         state: Entity<EditorState>,
         mode: MarkdownMode,
@@ -1283,6 +1336,81 @@ mod tests {
         cx.run_until_parked();
         cx.update(|window, cx| window.draw(cx).clear());
         (content, state, cx)
+    }
+
+    #[gpui::test]
+    fn many_fences_only_create_visible_editors_and_retain_them_across_edits(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(crate::init);
+        let source = (0..64)
+            .map(|index| format!("```typescript\nconst item{index} = {index};\n```\n\n"))
+            .collect::<String>();
+        let (view, state, cx) = editor(cx, &source);
+        let focus = LAST_CODE_FOCUS.with(|last| last.borrow().clone()).unwrap();
+        let initial = focus.borrow().editor_ids();
+        assert!(!initial.is_empty());
+        assert!(
+            initial.len() < 16,
+            "cold layout must not construct all 64 editors: {}",
+            initial.len()
+        );
+        // Edit the visible first fence through its nested editor.
+        let nested = cx.read(|cx| focus.borrow().first_editor(cx).unwrap());
+        cx.update(|window, cx| {
+            nested.update(cx, |nested, cx| {
+                nested.focus(window, cx);
+                nested.set_selected_range(0..0, cx);
+                nested.replace_text_in_range(None, "// edit\n", window, cx);
+            })
+        });
+        redraw(cx);
+        assert!(
+            state
+                .read_with(cx, |state, _| state.value())
+                .contains("// edit")
+        );
+        let after = focus.borrow().editor_ids();
+        assert_eq!(
+            initial[0], after[0],
+            "editing code must preserve the nested entity"
+        );
+        for mode in [
+            MarkdownMode::Source,
+            MarkdownMode::Preview,
+            MarkdownMode::LivePreview,
+        ] {
+            view.update(cx, |view, cx| {
+                view.mode = mode;
+                cx.notify();
+            });
+            redraw(cx);
+        }
+        let resumed = LAST_CODE_FOCUS.with(|last| last.borrow().clone()).unwrap();
+        assert!(
+            Rc::ptr_eq(&focus, &resumed),
+            "Source and Preview must retain the presentation session"
+        );
+        assert_eq!(initial[0], resumed.borrow().editor_ids()[0]);
+        view.update(cx, |view, cx| {
+            view.mode = MarkdownMode::Source;
+            cx.notify();
+        });
+        cx.update(|window, cx| state.update(cx, |state, cx| state.focus(window, cx)));
+        redraw(cx);
+        cx.dispatch_action(super::super::Undo);
+        redraw(cx);
+        assert_eq!(
+            state.read_with(cx, |state, _| state.value()).as_ref(),
+            source
+        );
+        cx.dispatch_action(super::super::Redo);
+        redraw(cx);
+        assert!(
+            state
+                .read_with(cx, |state, _| state.value())
+                .contains("// edit")
+        );
     }
 
     #[gpui::test]

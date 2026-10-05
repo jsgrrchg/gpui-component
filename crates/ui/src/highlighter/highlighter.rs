@@ -1,10 +1,11 @@
 #[cfg(test)]
 use crate::highlighter::HighlightTheme;
-use crate::highlighter::LanguageRegistry;
+use crate::highlighter::{LanguageRegistry, registry::RegisteredLanguage};
 
 use anyhow::{Context, Result, anyhow};
 use gpui::{HighlightStyle, SharedString};
 
+use crate::input::RopeExt as _;
 use ropey::{ChunkCursor, Rope};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -33,14 +34,17 @@ const INJECTION_PARSE_TIMEOUT: Duration = Duration::from_millis(20);
 #[allow(unused)]
 pub struct SyntaxHighlighter {
     language: SharedString,
-    query: Option<Query>,
+    requested_language: SharedString,
+    configuration: Option<Arc<RegisteredLanguage>>,
+    registry_revision: u64,
+    query: Option<Arc<Query>>,
     /// The full injections query. This is used to build injection layers during parsing.
     injections_query: Option<Arc<Query>>,
 
     locals_pattern_index: usize,
     highlights_pattern_index: usize,
     // highlight_indices: Vec<Option<Highlight>>,
-    non_local_variable_patterns: Vec<bool>,
+    non_local_variable_patterns: Arc<Vec<bool>>,
     injection_content_capture_index: Option<u32>,
     injection_language_capture_index: Option<u32>,
     local_scope_capture_index: Option<u32>,
@@ -57,6 +61,23 @@ pub struct SyntaxHighlighter {
     /// Parsed injection trees.
     /// These are built once in update() and queried multiple times in match_styles().
     injection_layers: Vec<InjectionLayer>,
+}
+
+/// Compiled immutable queries and capture metadata, shared across instances.
+#[allow(unused)]
+pub(crate) struct CompiledQueries {
+    query: Arc<Query>,
+    injections_query: Option<Arc<Query>>,
+    locals_pattern_index: usize,
+    highlights_pattern_index: usize,
+    // highlight_indices: Vec<Option<Highlight>>,
+    non_local_variable_patterns: Arc<Vec<bool>>,
+    injection_content_capture_index: Option<u32>,
+    injection_language_capture_index: Option<u32>,
+    local_scope_capture_index: Option<u32>,
+    local_def_capture_index: Option<u32>,
+    local_def_value_capture_index: Option<u32>,
+    local_ref_capture_index: Option<u32>,
 }
 
 /// A parsed injection layer.
@@ -350,12 +371,15 @@ impl SyntaxHighlighter {
     /// for languages without a grammar.
     fn build_inert(language: SharedString) -> Self {
         Self {
+            requested_language: language.clone(),
             language,
+            configuration: None,
+            registry_revision: LanguageRegistry::singleton().revision(),
             query: None,
             injections_query: None,
             locals_pattern_index: 0,
             highlights_pattern_index: 0,
-            non_local_variable_patterns: Vec::new(),
+            non_local_variable_patterns: Arc::new(Vec::new()),
             injection_content_capture_index: None,
             injection_language_capture_index: None,
             local_scope_capture_index: None,
@@ -372,23 +396,61 @@ impl SyntaxHighlighter {
     /// Build the highlighter for the given language.
     ///
     /// https://github.com/tree-sitter/tree-sitter/blob/v0.26.8/crates/highlight/src/highlight.rs#L339
-    fn build_for_language(lang: &str) -> Result<Self> {
-        let Some(config) = LanguageRegistry::singleton().language(&lang) else {
-            return Err(anyhow!(
-                "language {:?} is not registered in `LanguageRegistry`",
-                lang
-            ));
-        };
+    pub(crate) fn build_for_language(lang: &str) -> Result<Self> {
+        let entry = LanguageRegistry::singleton()
+            .snapshot(lang)
+            .ok_or_else(|| anyhow!("language {lang:?} is not registered"))?;
+        let mut result = Self::build_from_snapshot(&entry)?;
+        result.requested_language = lang.to_owned().into();
+        Ok(result)
+    }
 
-        // Languages without grammar default to a highlighter that never
-        // parses and creates no styles.
+    pub(crate) fn build_from_snapshot(entry: &Arc<RegisteredLanguage>) -> Result<Self> {
+        let config = &entry.config;
         let Some(grammar) = config.language.as_ref() else {
             return Ok(Self::build_inert(config.name.clone()));
         };
-
+        // This method may block on a concurrent compilation. UI consumers call
+        // it exclusively on the background executor.
+        let compiled = entry
+            .queries
+            .get_or_init(|| {
+                Self::compile_queries(config)
+                    .map(Arc::new)
+                    .map_err(|error| error.to_string())
+            })
+            .as_ref()
+            .map_err(|error| anyhow!("{error}"))?;
         let mut parser = Parser::new();
         parser.set_language(grammar).context("parse set_language")?;
+        Ok(Self {
+            language: config.name.clone(),
+            requested_language: config.name.clone(),
+            configuration: Some(entry.clone()),
+            registry_revision: LanguageRegistry::singleton().revision(),
+            query: Some(compiled.query.clone()),
+            injections_query: compiled.injections_query.clone(),
+            locals_pattern_index: compiled.locals_pattern_index,
+            highlights_pattern_index: compiled.highlights_pattern_index,
+            non_local_variable_patterns: compiled.non_local_variable_patterns.clone(),
+            injection_content_capture_index: compiled.injection_content_capture_index,
+            injection_language_capture_index: compiled.injection_language_capture_index,
+            local_scope_capture_index: compiled.local_scope_capture_index,
+            local_def_capture_index: compiled.local_def_capture_index,
+            local_def_value_capture_index: compiled.local_def_value_capture_index,
+            local_ref_capture_index: compiled.local_ref_capture_index,
+            text: Rope::new(),
+            parser,
+            tree: None,
+            injection_layers: Vec::new(),
+        })
+    }
 
+    fn compile_queries(config: &super::LanguageConfig) -> Result<CompiledQueries> {
+        let grammar = config
+            .language
+            .as_ref()
+            .ok_or_else(|| anyhow!("no grammar"))?;
         // Concatenate the query strings, keeping track of the start offset of each section.
         let mut query_source = String::new();
         query_source.push_str(&config.injections);
@@ -429,7 +491,7 @@ impl SyntaxHighlighter {
 
         // Find all of the highlighting patterns that are disabled for nodes that
         // have been identified as local variables.
-        let non_local_variable_patterns = (0..query.pattern_count())
+        let non_local_variable_patterns: Vec<bool> = (0..query.pattern_count())
             .map(|i| {
                 query
                     .property_predicates(i)
@@ -466,27 +528,75 @@ impl SyntaxHighlighter {
             }
         }
 
-        // let highlight_indices = vec![None; query.capture_names().len()];
-
-        Ok(Self {
-            language: config.name.clone(),
-            query: Some(query),
+        Ok(CompiledQueries {
+            query: Arc::new(query),
             injections_query,
-
             locals_pattern_index,
             highlights_pattern_index,
-            non_local_variable_patterns,
+            non_local_variable_patterns: Arc::new(non_local_variable_patterns),
             injection_content_capture_index,
             injection_language_capture_index,
             local_scope_capture_index,
             local_def_capture_index,
             local_def_value_capture_index,
             local_ref_capture_index,
-            text: Rope::new(),
-            parser,
-            tree: None,
-            injection_layers: Vec::new(),
         })
+    }
+
+    /// Compile and parse on a worker. Cancellation is checked after shared
+    /// compilation as well as during parsing; compilation itself is single flight.
+    pub(crate) fn parse_background(
+        entry: &Arc<RegisteredLanguage>,
+        text: &Rope,
+        old_tree: Option<Tree>,
+        old_injections: Option<InjectionParseData>,
+        cancel: &std::sync::atomic::AtomicBool,
+    ) -> Option<Self> {
+        use std::sync::atomic::Ordering;
+        if cancel.load(Ordering::Relaxed) {
+            return None;
+        }
+        let mut result = Self::build_from_snapshot(entry).ok()?;
+        if cancel.load(Ordering::Relaxed) {
+            return None;
+        }
+        if result.parser.language().is_none() {
+            result.text = text.clone();
+            return Some(result);
+        }
+        let mut progress = |_: &tree_sitter::ParseState| {
+            if cancel.load(Ordering::Relaxed) {
+                ControlFlow::Break(())
+            } else {
+                ControlFlow::Continue(())
+            }
+        };
+        let options = ParseOptions::new().progress_callback(&mut progress);
+        let tree = result.parser.parse_with_options(
+            &mut |offset, _| {
+                if offset >= text.len() {
+                    ""
+                } else {
+                    let (chunk, start) = text.chunk(offset);
+                    &chunk[offset - start..]
+                }
+            },
+            old_tree.as_ref(),
+            Some(options),
+        )?;
+        result.text = text.clone();
+        if let Some(mut data) = result.injection_parse_data() {
+            if let Some(old) = old_injections {
+                data.old_layers = old.old_layers;
+            }
+            result.injection_layers =
+                Self::compute_injection_layers_with_cancel(data, &tree, text, Some(cancel));
+        }
+        if cancel.load(Ordering::Relaxed) {
+            return None;
+        }
+        result.tree = Some(tree);
+        Some(result)
     }
 
     pub fn is_empty(&self) -> bool {
@@ -503,6 +613,13 @@ impl SyntaxHighlighter {
     pub fn edit_tree(&mut self, edit: Option<InputEdit>, text: &Rope) {
         if let (Some(edit), Some(tree)) = (edit, self.tree.as_mut()) {
             tree.edit(&edit);
+        } else if edit.is_none() && self.text != *text {
+            self.tree = None;
+        }
+        // These trees use disjoint included ranges and have not received the
+        // structural edit. Never query their old byte ranges against new text.
+        if self.text != *text {
+            self.injection_layers.clear();
         }
         self.text = text.clone();
     }
@@ -531,7 +648,33 @@ impl SyntaxHighlighter {
         text: &Rope,
         timeout: Option<Duration>,
     ) -> bool {
-        if self.text.eq(text) {
+        let registry = LanguageRegistry::singleton();
+        if self.registry_revision != registry.revision() {
+            if let Some(entry) = registry.snapshot(&self.requested_language)
+                && self
+                    .configuration
+                    .as_ref()
+                    .is_none_or(|current| !Arc::ptr_eq(current, &entry))
+            {
+                let mut replacement = Self::build_from_snapshot(&entry).unwrap_or_else(|error| {
+                    tracing::warn!("invalid replacement language configuration: {error}");
+                    let mut inert = Self::build_inert(entry.config.name.clone());
+                    inert.configuration = Some(entry.clone());
+                    inert
+                });
+                replacement.requested_language = self.requested_language.clone();
+                *self = replacement;
+                return self.update(None, text, timeout);
+            }
+            self.registry_revision = registry.revision();
+            if self.text.eq(text)
+                && let Some(tree) = self.tree.clone()
+            {
+                self.injection_layers.clear();
+                self.parse_injection_layers(&tree);
+            }
+        }
+        if self.text.eq(text) && self.tree.is_some() {
             return true;
         }
 
@@ -543,11 +686,17 @@ impl SyntaxHighlighter {
 
         let edit = edit.unwrap_or(InputEdit {
             start_byte: 0,
-            old_end_byte: 0,
+            old_end_byte: self.text.len(),
             new_end_byte: text.len(),
             start_position: Point::new(0, 0),
-            old_end_position: Point::new(0, 0),
-            new_end_position: Point::new(0, 0),
+            old_end_position: {
+                let p = self.text.offset_to_point(self.text.len());
+                Point::new(p.row, p.column)
+            },
+            new_end_position: {
+                let p = text.offset_to_point(text.len());
+                Point::new(p.row, p.column)
+            },
         });
 
         let mut old_tree = self
@@ -595,6 +744,7 @@ impl SyntaxHighlighter {
         let new_tree = new_tree.unwrap();
         self.tree = Some(new_tree.clone());
         self.text = text.clone();
+        self.injection_layers.clear();
         self.parse_injection_layers(&new_tree);
         true
     }
@@ -627,6 +777,15 @@ impl SyntaxHighlighter {
         data: InjectionParseData,
         tree: &Tree,
         text: &Rope,
+    ) -> Vec<InjectionLayer> {
+        Self::compute_injection_layers_with_cancel(data, tree, text, None)
+    }
+
+    fn compute_injection_layers_with_cancel(
+        data: InjectionParseData,
+        tree: &Tree,
+        text: &Rope,
+        cancel: Option<&std::sync::atomic::AtomicBool>,
     ) -> Vec<InjectionLayer> {
         struct CombinedRanges {
             ranges: Vec<tree_sitter::Range>,
@@ -667,39 +826,33 @@ impl SyntaxHighlighter {
 
         fn resolve_language(
             language_name: &str,
-            query_cache: &mut HashMap<SharedString, Arc<Query>>,
-        ) -> Option<(SharedString, Arc<Query>)> {
-            let config = LanguageRegistry::singleton().language(language_name)?;
-            if let Some(query) = query_cache.get(&config.name) {
-                return Some((config.name, query.clone()));
-            }
-
-            let query = match Query::new(config.language.as_ref()?, &config.highlights) {
-                Ok(query) => Arc::new(query),
-                Err(error) => {
-                    tracing::error!(
-                        "failed to build injection query for {:?}: {:?}",
-                        config.name,
-                        error
-                    );
-                    return None;
-                }
-            };
-            query_cache.insert(config.name.clone(), query.clone());
-            Some((config.name, query))
+            query_cache: &mut HashMap<(SharedString, usize), (Arc<Query>, tree_sitter::Language)>,
+        ) -> Option<(SharedString, Arc<Query>, tree_sitter::Language)> {
+            let entry = LanguageRegistry::singleton().snapshot(language_name)?;
+            let query = entry.highlight_query()?;
+            let grammar = entry.config.language.clone()?;
+            query_cache.insert(
+                (entry.config.name.clone(), Arc::as_ptr(&query) as usize),
+                (query.clone(), grammar.clone()),
+            );
+            Some((entry.config.name.clone(), query, grammar))
         }
 
         let root_node = tree.root_node();
         let mut cursor = QueryCursor::new();
         let mut matches = cursor.matches(&data.query, root_node, TextProvider(text));
 
-        let mut combined_ranges: HashMap<SharedString, CombinedRanges> = HashMap::new();
+        let mut combined_ranges: HashMap<(SharedString, usize), CombinedRanges> = HashMap::new();
         let old_layer_trees: HashMap<_, _> = data
             .old_layers
             .iter()
             .map(|layer| {
                 (
-                    (layer.language_name.clone(), ranges_cache_key(&layer.ranges)),
+                    (
+                        layer.language_name.clone(),
+                        Arc::as_ptr(&layer.highlight_query) as usize,
+                        ranges_cache_key(&layer.ranges),
+                    ),
                     &layer.tree,
                 )
             })
@@ -707,18 +860,22 @@ impl SyntaxHighlighter {
         // Query objects are relatively expensive. Reuse one Arc per language
         // from the previous parse and compile only languages present in this
         // document, rather than eagerly retaining every registered grammar.
-        let mut highlight_queries: HashMap<SharedString, Arc<Query>> = data
-            .old_layers
-            .iter()
-            .map(|layer| (layer.language_name.clone(), layer.highlight_query.clone()))
-            .collect();
+        let mut highlight_queries: HashMap<
+            (SharedString, usize),
+            (Arc<Query>, tree_sitter::Language),
+        > = HashMap::new();
         // Cache raw names as well as canonical queries. Otherwise every fence with the
         // same info string would lock the registry and clone its language configuration.
-        let mut resolved_languages: HashMap<SharedString, Option<(SharedString, Arc<Query>)>> =
-            HashMap::new();
+        let mut resolved_languages: HashMap<
+            SharedString,
+            Option<(SharedString, Arc<Query>, tree_sitter::Language)>,
+        > = HashMap::new();
         let mut new_layers = Vec::new();
         let mut non_combined_parses = 0usize;
         while let Some(query_match) = matches.next() {
+            if cancel.is_some_and(|cancel| cancel.load(std::sync::atomic::Ordering::Relaxed)) {
+                return Vec::new();
+            }
             let mut language_name: Option<SharedString> = None;
             let mut combined = false;
             for prop in data.query.property_settings(query_match.pattern_index) {
@@ -760,7 +917,7 @@ impl SyntaxHighlighter {
                     resolved_languages.insert(raw_language_name, resolved.clone());
                     resolved
                 };
-            let Some((language_name, highlight_query)) = resolved_language else {
+            let Some((language_name, highlight_query, grammar)) = resolved_language else {
                 continue;
             };
 
@@ -782,7 +939,10 @@ impl SyntaxHighlighter {
 
             if combined {
                 combined_ranges
-                    .entry(language_name.clone())
+                    .entry((
+                        language_name.clone(),
+                        Arc::as_ptr(&highlight_query) as usize,
+                    ))
                     .or_insert_with(|| CombinedRanges {
                         ranges: Vec::new(),
                         byte_count: 0,
@@ -795,21 +955,27 @@ impl SyntaxHighlighter {
 
                 non_combined_parses += 1;
                 let old_tree = old_layer_trees
-                    .get(&(language_name.clone(), ranges_cache_key(&ranges)))
+                    .get(&(
+                        language_name.clone(),
+                        Arc::as_ptr(&highlight_query) as usize,
+                        ranges_cache_key(&ranges),
+                    ))
                     .copied();
                 if let Some(layer) = Self::parse_injection_layer(
                     &language_name,
+                    &grammar,
                     highlight_query,
                     ranges,
                     old_tree,
                     text,
+                    cancel,
                 ) {
                     new_layers.push(layer);
                 }
             }
         }
 
-        for (language_name, combined) in combined_ranges {
+        for ((language_name, query_identity), combined) in combined_ranges {
             let mut ranges = combined.ranges;
             if ranges.is_empty() {
                 continue;
@@ -819,15 +985,28 @@ impl SyntaxHighlighter {
             if ranges.is_empty() {
                 continue;
             }
-            let old_tree = old_layer_trees
-                .get(&(language_name.clone(), ranges_cache_key(&ranges)))
-                .copied();
-            let Some(highlight_query) = highlight_queries.get(&language_name).cloned() else {
+            let Some((highlight_query, grammar)) = highlight_queries
+                .get(&(language_name.clone(), query_identity))
+                .cloned()
+            else {
                 continue;
             };
-            if let Some(layer) =
-                Self::parse_injection_layer(&language_name, highlight_query, ranges, old_tree, text)
-            {
+            let old_tree = old_layer_trees
+                .get(&(
+                    language_name.clone(),
+                    Arc::as_ptr(&highlight_query) as usize,
+                    ranges_cache_key(&ranges),
+                ))
+                .copied();
+            if let Some(layer) = Self::parse_injection_layer(
+                &language_name,
+                &grammar,
+                highlight_query,
+                ranges,
+                old_tree,
+                text,
+                cancel,
+            ) {
                 new_layers.push(layer);
             }
         }
@@ -839,24 +1018,27 @@ impl SyntaxHighlighter {
     /// Reuses the previous tree only when the language and byte ranges still match.
     fn parse_injection_layer(
         language_name: &SharedString,
+        grammar: &tree_sitter::Language,
         highlight_query: Arc<Query>,
         ranges: Vec<tree_sitter::Range>,
         old_tree: Option<&Tree>,
         text: &Rope,
+        cancel: Option<&std::sync::atomic::AtomicBool>,
     ) -> Option<InjectionLayer> {
         fn bounding_byte_range(ranges: &[tree_sitter::Range]) -> Option<Range<usize>> {
             let start = ranges.iter().map(|r| r.start_byte).min()?;
             let end = ranges.iter().map(|r| r.end_byte).max()?;
             Some(start..end)
         }
-        let config = LanguageRegistry::singleton().language(language_name)?;
         let mut parser = Parser::new();
-        parser.set_language(config.language.as_ref()?).ok()?;
+        parser.set_language(grammar).ok()?;
         parser.set_included_ranges(&ranges).ok()?;
         let parse_start = Instant::now();
         let mut timed_out = false;
         let mut progress = |_: &tree_sitter::ParseState| -> ControlFlow<()> {
-            if parse_start.elapsed() > INJECTION_PARSE_TIMEOUT {
+            if parse_start.elapsed() > INJECTION_PARSE_TIMEOUT
+                || cancel.is_some_and(|cancel| cancel.load(std::sync::atomic::Ordering::Relaxed))
+            {
                 timed_out = true;
                 ControlFlow::Break(())
             } else {
@@ -889,25 +1071,6 @@ impl SyntaxHighlighter {
             byte_range,
             tree: new_tree,
         })
-    }
-
-    /// Apply a tree that was parsed on a background thread.
-    ///
-    /// `injection_layers` must also be pre-computed in the background via
-    /// [`compute_injection_layers`] to avoid blocking the main thread.
-    pub(crate) fn apply_background_tree(
-        &mut self,
-        tree: Tree,
-        text: &Rope,
-        injection_layers: Vec<InjectionLayer>,
-    ) {
-        // Only apply if the text still matches what was parsed.
-        if !self.text.eq(text) {
-            return;
-        }
-
-        self.tree = Some(tree);
-        self.injection_layers = injection_layers;
     }
 
     /// Parse injection layers after the main tree is updated.
@@ -1286,6 +1449,136 @@ mod tests {
 
     use super::*;
     use crate::Colorize as _;
+
+    #[test]
+    fn compiled_queries_are_shared_and_configuration_replacements_are_isolated() {
+        let registry = LanguageRegistry::singleton();
+        let config = super::super::LanguageConfig::new(
+            "shared-query-test",
+            tree_sitter_json::LANGUAGE.into(),
+            vec![],
+            "(string) @string",
+            "",
+            "",
+        );
+        registry.register("shared-query-test", &config);
+        registry.register("shared-query-test-alias", &config);
+        let first = SyntaxHighlighter::new("shared-query-test");
+        let second = SyntaxHighlighter::new("shared-query-test-alias");
+        assert!(Arc::ptr_eq(
+            first.query.as_ref().unwrap(),
+            second.query.as_ref().unwrap()
+        ));
+        let entry = registry.snapshot("shared-query-test").unwrap();
+        let threads: Vec<_> = (0..16)
+            .map(|_| {
+                let entry = entry.clone();
+                std::thread::spawn(move || {
+                    SyntaxHighlighter::build_from_snapshot(&entry)
+                        .unwrap()
+                        .query
+                        .unwrap()
+                })
+            })
+            .collect();
+        for thread in threads {
+            assert!(Arc::ptr_eq(
+                first.query.as_ref().unwrap(),
+                &thread.join().unwrap()
+            ));
+        }
+        let revision = registry.revision();
+        registry.register("shared-query-test", &config);
+        assert_eq!(registry.revision(), revision);
+        let mut replacement = config.clone();
+        replacement.highlights = "(number) @number".into();
+        registry.register("shared-query-test", &replacement);
+        let third = SyntaxHighlighter::new("shared-query-test");
+        assert!(!Arc::ptr_eq(
+            first.query.as_ref().unwrap(),
+            third.query.as_ref().unwrap()
+        ));
+        assert_eq!(third.query.as_ref().unwrap().capture_names(), &["number"]);
+        // An explicitly registered alias is an independent mapping.
+        assert!(Arc::ptr_eq(
+            first.query.as_ref().unwrap(),
+            SyntaxHighlighter::new("shared-query-test-alias")
+                .query
+                .as_ref()
+                .unwrap()
+        ));
+        let mut first = first;
+        first.update(None, &Rope::from_str("123"), None);
+        assert!(Arc::ptr_eq(
+            first.query.as_ref().unwrap(),
+            third.query.as_ref().unwrap()
+        ));
+    }
+
+    #[cfg(feature = "tree-sitter-markdown")]
+    #[test]
+    fn foreground_edits_discard_unedited_injection_ranges() {
+        let mut highlighter = SyntaxHighlighter::new("markdown");
+        let text = Rope::from_str("```json\n{\"long\":123}\n```\n");
+        highlighter.update(None, &text, None);
+        assert!(!highlighter.injection_layers.is_empty());
+        let shortened = Rope::from_str("é");
+        highlighter.edit_tree(None, &shortened);
+        assert!(highlighter.tree().is_none());
+        assert!(highlighter.injection_layers.is_empty());
+        assert_eq!(
+            highlighter.styles(
+                &(0..shortened.len()),
+                HighlightTheme::default_dark().as_ref()
+            ),
+            vec![(0..shortened.len(), HighlightStyle::default())]
+        );
+    }
+
+    #[test]
+    fn cancelled_background_initialization_does_not_publish_a_tree() {
+        let registry = LanguageRegistry::singleton();
+        let entry = registry.snapshot("json").unwrap();
+        let cancelled = std::sync::atomic::AtomicBool::new(true);
+        assert!(
+            SyntaxHighlighter::parse_background(
+                &entry,
+                &Rope::from_str("123"),
+                None,
+                None,
+                &cancelled
+            )
+            .is_none()
+        );
+    }
+
+    #[cfg(feature = "tree-sitter-markdown")]
+    #[test]
+    fn injection_alias_uses_its_snapshot_grammar_and_replacement_query() {
+        let registry = LanguageRegistry::singleton();
+        let mut config = super::super::LanguageConfig::new(
+            "json",
+            tree_sitter_json::LANGUAGE.into(),
+            vec![],
+            "(string) @string",
+            "",
+            "",
+        );
+        registry.register("injection-snapshot-test", &config);
+        let text = Rope::from_str("```injection-snapshot-test\n{\"a\":123}\n```\n");
+        let mut highlighter = SyntaxHighlighter::new("markdown");
+        highlighter.update(None, &text, None);
+        let query = highlighter.injection_layers[0].highlight_query.clone();
+        assert_eq!(query.capture_names(), &["string"]);
+        config.highlights = "(number) @number".into();
+        registry.register("injection-snapshot-test", &config);
+        // Reparse unchanged source after a registry revision: injection queries
+        // must refresh even when the host configuration did not change.
+        highlighter.update(None, &text, None);
+        let updated = &highlighter.injection_layers[0].highlight_query;
+        assert!(!Arc::ptr_eq(&query, updated));
+        assert_eq!(updated.capture_names(), &["number"]);
+    }
 
     fn color_style(color: Hsla) -> HighlightStyle {
         let mut style = HighlightStyle::default();
