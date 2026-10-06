@@ -3,8 +3,9 @@ use std::rc::Rc;
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
     AccessibleAction, AnyElement, App, DefiniteLength, Edges, Entity, Hsla,
-    InteractiveElement as _, IntoElement, ParentElement as _, Rems, RenderOnce, Role, SharedString,
-    StatefulInteractiveElement as _, StyleRefinement, Styled, TextAlign, Window, div, px, relative,
+    InteractiveElement as _, IntoElement, ParentElement as _, Pixels, Rems, RenderOnce, Role,
+    SharedString, StatefulInteractiveElement as _, StyleRefinement, Styled, TextAlign, Window, div,
+    px, relative,
 };
 
 use crate::button::{Button, ButtonVariants as _};
@@ -126,6 +127,7 @@ pub struct Input {
     role: RoleOverride,
     accessibility_id: Option<SharedString>,
     aria_label: Option<SharedString>,
+    content_padding: Option<Edges<Pixels>>,
 
     /// An optional context menu builder to allow a custom context menu on the input.
     ///
@@ -197,6 +199,7 @@ impl Input {
             role: RoleOverride::default(),
             accessibility_id: None,
             aria_label: None,
+            content_padding: None,
             context_menu_builder: None,
         }
     }
@@ -237,6 +240,15 @@ impl Input {
     /// Set the appearance of the input field, if false the input field will no border, background.
     pub fn appearance(mut self, appearance: bool) -> Self {
         self.appearance = appearance;
+        self
+    }
+
+    /// Pad multi-line text inside the input instead of using the size
+    /// preset's padding. The scrollbar and scroll area keep the full input
+    /// bounds, so a wide input can center a narrower text column while its
+    /// scrollbar stays at the outer edge.
+    pub fn content_padding(mut self, padding: impl Into<Edges<Pixels>>) -> Self {
+        self.content_padding = Some(padding.into());
         self
     }
 
@@ -410,12 +422,12 @@ impl RenderOnce for Input {
         );
         state.set_editor_paddings(
             if state.presentation(cx).is_multi_line() {
-                Edges {
+                self.content_padding.unwrap_or(Edges {
                     top: self.size.input_py(),
                     right: self.size.input_px(),
                     bottom: self.size.input_py(),
                     left: self.size.input_px(),
-                }
+                })
             } else {
                 Edges::default()
             },

@@ -1,6 +1,6 @@
 use gpui::{
-    App, InteractiveElement as _, IntoElement, ListState, ParentElement as _, SharedString,
-    Styled as _, Window, div,
+    App, Edges, InteractiveElement as _, IntoElement, ListState, ParentElement as _, Pixels,
+    SharedString, Styled as _, Window, div,
 };
 
 use std::ops::RangeInclusive;
@@ -178,6 +178,7 @@ impl ParsedDocument {
     pub(super) fn render_root(
         &self,
         list_state: Option<ListState>,
+        padding: Edges<Pixels>,
         node_cx: &NodeContext,
         window: &mut Window,
         cx: &mut App,
@@ -186,6 +187,10 @@ impl ParsedDocument {
             let blocks_len = self.blocks.len();
             return div()
                 .id("document")
+                .pt(padding.top)
+                .pr(padding.right)
+                .pb(padding.bottom)
+                .pl(padding.left)
                 .children(self.blocks.iter().enumerate().map(move |(ix, node)| {
                     let is_last = ix + 1 == blocks_len;
                     node.render_block(
@@ -218,21 +223,34 @@ impl ParsedDocument {
                 let blocks = blocks.clone();
                 move |ix, window, cx| {
                     let is_last = ix + 1 == blocks.len();
-                    blocks[ix]
-                        .render_block(
-                            NodeRenderOptions {
-                                ix,
-                                is_last,
-                                ..options
-                            },
-                            &node_cx,
-                            window,
-                            cx,
-                        )
-                        .into_any_element()
+                    let block = blocks[ix].render_block(
+                        NodeRenderOptions {
+                            ix,
+                            is_last,
+                            ..options
+                        },
+                        &node_cx,
+                        window,
+                        cx,
+                    );
+                    // `gpui::list` measures rows at its full width and only
+                    // honours vertical padding, so rows carry the horizontal
+                    // inset themselves.
+                    if padding.left == Pixels::ZERO && padding.right == Pixels::ZERO {
+                        block.into_any_element()
+                    } else {
+                        div()
+                            .pl(padding.left)
+                            .pr(padding.right)
+                            .child(block)
+                            .into_any_element()
+                    }
                 }
             })
-            .size_full(),
+            .size_full()
+            // Vertical padding scrolls with the content.
+            .pt(padding.top)
+            .pb(padding.bottom),
         )
     }
 }

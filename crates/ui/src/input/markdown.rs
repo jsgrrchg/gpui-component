@@ -8,10 +8,10 @@ use std::{
 };
 
 use gpui::{
-    App, BorderStyle, Bounds, ContentMask, Context, Entity, EntityInputHandler, FontStyle,
+    App, BorderStyle, Bounds, ContentMask, Context, Edges, Entity, EntityInputHandler, FontStyle,
     FontWeight, HighlightStyle, InteractiveElement, IntoElement, MouseButton, MouseDownEvent,
     ParentElement, Pixels, Render, SharedString, Styled, Subscription, TransformationMatrix,
-    WeakEntity, Window, canvas, div, point, px, quad, rems, size,
+    WeakEntity, Window, canvas, div, point, prelude::FluentBuilder as _, px, quad, rems, size,
 };
 use gpui_base::input::{
     DisplayReplacement, EditorDisplay, EditorDisplayBlock, EditorDisplayBlockCache,
@@ -64,6 +64,20 @@ pub(super) struct MarkdownReadingPreview {
     _observation: Subscription,
     text: super::Rope,
     source: SharedString,
+    content_padding: Option<Edges<Pixels>>,
+}
+
+impl MarkdownReadingPreview {
+    pub(super) fn set_content_padding(
+        &mut self,
+        padding: Option<Edges<Pixels>>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.content_padding != padding {
+            self.content_padding = padding;
+            cx.notify();
+        }
+    }
 }
 
 pub(super) fn reading_preview(
@@ -86,6 +100,7 @@ pub(super) fn reading_preview(
                 state,
                 text: super::Rope::new(),
                 source: SharedString::default(),
+                content_padding: None,
                 _subscription: subscription,
             }
         },
@@ -112,6 +127,9 @@ impl Render for MarkdownReadingPreview {
         .markdown_extensions(code_block::extensions())
         .selectable(true)
         .scrollable(true)
+        .when_some(self.content_padding, |view, padding| {
+            view.content_padding(padding)
+        })
         .size_full()
     }
 }
@@ -1534,6 +1552,7 @@ mod tests {
         state: Entity<EditorState>,
         mode: MarkdownMode,
         readonly: bool,
+        content_padding: Option<Edges<Pixels>>,
     }
 
     impl Render for MarkdownEditorTest {
@@ -1546,6 +1565,9 @@ mod tests {
                     super::super::Editor::new(&self.state)
                         .markdown_mode(self.mode)
                         .readonly(self.readonly)
+                        .when_some(self.content_padding, |editor, padding| {
+                            editor.content_padding(padding)
+                        })
                         .size_full(),
                 )
         }
@@ -1571,6 +1593,7 @@ mod tests {
                 state,
                 mode: MarkdownMode::LivePreview,
                 readonly: false,
+                content_padding: None,
             });
             crate::Root::new(content, window, cx)
         });
@@ -2323,7 +2346,7 @@ mod tests {
         let (view, cx) = cx.add_window_view(|window, cx| {
             let state = cx.new(|cx| EditorState::new(window, cx).language("markdown").line_number(false).folding(false)
                 .default_value("# Heading\n\n**niño 世界**\n\n```rust\nlet n = 1;\n```\n\n| A | B |\n| - | - |\n| a | b |\n"));
-            let content = cx.new(|_| MarkdownEditorTest { state, mode: MarkdownMode::LivePreview, readonly: false });
+            let content = cx.new(|_| MarkdownEditorTest { state, mode: MarkdownMode::LivePreview, readonly: false, content_padding: None });
             crate::Root::new(content, window, cx)
         });
         let content = view.read_with(cx, |view, _| {
@@ -2388,6 +2411,48 @@ mod tests {
 
     const CODE_SOURCE: &str = "intro\n\n```rust\nlet x = 1;\n```\n\nend";
     const CODE_START: usize = 7;
+
+    #[gpui::test]
+    fn content_padding_insets_text_while_the_scroll_area_keeps_the_frame(cx: &mut TestAppContext) {
+        cx.update(crate::init);
+        let source = (0..80)
+            .map(|line| format!("Paragraph {line} long enough to wrap inside a narrow column.\n\n"))
+            .collect::<String>();
+        let (view, state, cx) = editor(cx, &source);
+        let padding = Edges {
+            top: px(8.),
+            right: px(120.),
+            bottom: px(8.),
+            left: px(120.),
+        };
+        for mode in [MarkdownMode::LivePreview, MarkdownMode::Source] {
+            view.update(cx, |view, cx| {
+                view.mode = mode;
+                view.content_padding = Some(padding);
+                cx.notify();
+            });
+            redraw(cx);
+            let frame = cx.debug_bounds("markdown-test-editor").unwrap();
+            let text = state.read_with(cx, |state, _| state.input_bounds());
+            // Inside the 1px frame border, the text column starts and ends
+            // at the requested padding instead of the size preset's.
+            assert_eq!(text.left(), frame.left() + px(121.), "{mode:?}");
+            assert_eq!(text.right(), frame.right() - px(121.), "{mode:?}");
+            // The padding still belongs to the scroll area.
+            let before = state.read_with(cx, |state, _| state.scroll_offset().y);
+            cx.simulate_event(gpui::ScrollWheelEvent {
+                position: point(frame.left() + px(40.), frame.top() + px(200.)),
+                delta: gpui::ScrollDelta::Pixels(point(px(0.), px(-120.))),
+                ..Default::default()
+            });
+            redraw(cx);
+            let after = state.read_with(cx, |state, _| state.scroll_offset().y);
+            assert!(after < before, "{mode:?}: {before:?} -> {after:?}");
+            state.update(cx, |state, cx| {
+                state.set_scroll_offset(point(px(0.), px(0.)), cx)
+            });
+        }
+    }
 
     pub(super) fn redraw(cx: &mut VisualTestContext) {
         cx.run_until_parked();
@@ -2536,6 +2601,7 @@ mod tests {
                 state,
                 mode: MarkdownMode::LivePreview,
                 readonly: false,
+                content_padding: None,
             });
             crate::Root::new(content, window, cx)
         });

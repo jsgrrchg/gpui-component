@@ -1,8 +1,8 @@
 use std::{path::PathBuf, rc::Rc};
 
 use gpui::{
-    App, DefiniteLength, Entity, InteractiveElement as _, IntoElement, ParentElement, RenderOnce,
-    SharedString, StyleRefinement, Styled, Window, prelude::FluentBuilder as _,
+    App, DefiniteLength, Edges, Entity, InteractiveElement as _, IntoElement, ParentElement,
+    Pixels, RenderOnce, SharedString, StyleRefinement, Styled, Window, prelude::FluentBuilder as _,
 };
 
 use super::{EditorState, Input, MarkdownMode};
@@ -22,6 +22,7 @@ pub struct Editor {
     markdown_mode: Option<MarkdownMode>,
     markdown_image_root: Option<PathBuf>,
     markdown_notes: Option<crate::text::MarkdownNotes>,
+    content_padding: Option<Edges<Pixels>>,
     tab_index: isize,
     role: RoleOverride,
     aria_label: Option<SharedString>,
@@ -45,11 +46,20 @@ impl Editor {
             markdown_mode: None,
             markdown_image_root: None,
             markdown_notes: None,
+            content_padding: None,
             tab_index: 0,
             role: RoleOverride::default(),
             aria_label: None,
             context_menu_builder: None,
         }
+    }
+
+    /// Pad the text inside the editor's scroll area — Source, Live Preview
+    /// and the Markdown reading view alike — while the scrollbar stays at the
+    /// editor's outer edge. Replaces the size preset's padding.
+    pub fn content_padding(mut self, padding: impl Into<Edges<Pixels>>) -> Self {
+        self.content_padding = Some(padding.into());
+        self
     }
 
     pub fn h(mut self, height: impl Into<DefiniteLength>) -> Self {
@@ -151,9 +161,13 @@ impl RenderOnce for Editor {
                 super::markdown::set_image_root(&self.state, Some(root), window, cx);
             }
             if mode == MarkdownMode::Preview {
+                let preview = super::markdown::reading_preview(&self.state, window, cx);
+                preview.update(cx, |preview, cx| {
+                    preview.set_content_padding(self.content_padding, cx)
+                });
                 return gpui::div()
                     .size_full()
-                    .child(super::markdown::reading_preview(&self.state, window, cx))
+                    .child(preview)
                     .when_some(self.height, |this, height| this.h(height))
                     .refine_style(&self.style)
                     .into_any_element();
@@ -174,6 +188,9 @@ impl RenderOnce for Editor {
             .disabled(self.disabled)
             .readonly(self.readonly)
             .tab_index(self.tab_index)
+            .when_some(self.content_padding, |this, padding| {
+                this.content_padding(padding)
+            })
             .role(self.role)
             .when_some(self.aria_label, |this, label| this.aria_label(label))
             .when_some(self.context_menu_builder, |this, build| {

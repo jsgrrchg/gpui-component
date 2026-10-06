@@ -2,9 +2,9 @@ use std::sync::Arc;
 
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
-    AnyElement, App, Bounds, ClickEvent, Element, ElementId, Entity, GlobalElementId, Hitbox,
-    HitboxBehavior, InspectorElementId, InteractiveElement, IntoElement, LayoutId, MouseButton,
-    ParentElement, Pixels, SharedString, StyleRefinement, Styled, Window, div,
+    AnyElement, App, Bounds, ClickEvent, Edges, Element, ElementId, Entity, GlobalElementId,
+    Hitbox, HitboxBehavior, InspectorElementId, InteractiveElement, IntoElement, LayoutId,
+    MouseButton, ParentElement, Pixels, SharedString, StyleRefinement, Styled, Window, div,
 };
 
 use crate::StyledExt;
@@ -75,6 +75,7 @@ pub struct TextView {
     selectable: bool,
     selection_format: SelectionFormat,
     scrollable: bool,
+    content_padding: Edges<Pixels>,
     code_block_actions: Option<Arc<CodeBlockActionsFn>>,
     link_click_handler: Option<Arc<LinkClickHandlerFn>>,
     task_toggle_handler: Option<Arc<TaskToggleHandlerFn>>,
@@ -118,6 +119,7 @@ impl TextView {
             selectable: false,
             selection_format: SelectionFormat::default(),
             scrollable: false,
+            content_padding: Edges::default(),
             code_block_actions: None,
             link_click_handler: None,
             task_toggle_handler: None,
@@ -138,6 +140,7 @@ impl TextView {
             selectable: false,
             selection_format: SelectionFormat::default(),
             scrollable: false,
+            content_padding: Edges::default(),
             code_block_actions: None,
             link_click_handler: None,
             task_toggle_handler: None,
@@ -158,6 +161,7 @@ impl TextView {
             selectable: false,
             selection_format: SelectionFormat::default(),
             scrollable: false,
+            content_padding: Edges::default(),
             code_block_actions: None,
             link_click_handler: None,
             task_toggle_handler: None,
@@ -201,6 +205,14 @@ impl TextView {
     /// This mode is suitable for small content, such as a few lines of text, a label, etc.
     pub fn scrollable(mut self, scrollable: bool) -> Self {
         self.scrollable = scrollable;
+        self
+    }
+
+    /// Pad the content inside the scroll area. With `scrollable`, the padding
+    /// belongs to the virtualized list, so the scrollbar stays at the outer
+    /// edge and the padded margins still scroll.
+    pub fn content_padding(mut self, padding: impl Into<Edges<Pixels>>) -> Self {
+        self.content_padding = padding.into();
         self
     }
 
@@ -381,6 +393,7 @@ impl Element for TextView {
             state.selectable = self.selectable;
             state.selection_format = self.selection_format;
             state.scrollable = self.scrollable;
+            state.content_padding = self.content_padding;
             if state.text_view_style != self.text_view_style {
                 state.selection_revision = state.selection_revision.wrapping_add(1);
             }
