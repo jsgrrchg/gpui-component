@@ -785,11 +785,28 @@ impl<M: InputModeKind> InputBaseState<M> {
         let mut y_offset = last_layout.visible_top;
         for (vi, line) in last_layout.lines.iter().enumerate() {
             let prev_lines_offset = last_layout.visible_line_byte_offsets[vi];
-            let local_offset = offset.saturating_sub(prev_lines_offset);
+            // An offset above this line (scrolled out, or folded away) is not
+            // laid out; clamping it would place it at this line's start.
+            let Some(local_offset) = offset.checked_sub(prev_lines_offset) else {
+                y_offset += line.size(line_height).height;
+                continue;
+            };
             if let Some(pos) = line.position_for_index(local_offset, last_layout, false) {
                 let sub_line_index = (pos.y / line_height) as usize;
                 let adjusted_pos = point(pos.x + last_layout.line_number_width, pos.y + y_offset);
                 return (vi, sub_line_index, Some(adjusted_pos));
+            }
+            // A rendered block shapes no text: only its start has a glyph
+            // position. Place the rest of its source on its last row, so a
+            // range over the block spans the block.
+            if line.is_rendered_block() && local_offset <= line.len() {
+                let rows = (line.size(line_height).height / line_height) as usize;
+                let row = rows.saturating_sub(1);
+                let pos = point(
+                    last_layout.line_number_width,
+                    y_offset + line_height * row as f32,
+                );
+                return (vi, row, Some(pos));
             }
 
             y_offset += line.size(line_height).height;

@@ -2652,6 +2652,105 @@ mod tests {
         );
     }
 
+    #[gpui::test]
+    fn task_checkbox_is_not_painted_after_scrolling_past_it(cx: &mut TestAppContext) {
+        cx.update(crate::init);
+        let source = format!("- [x] Task\n{}end", "line\n".repeat(400));
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            let state = cx.new(|cx| {
+                EditorState::new(window, cx)
+                    .language("markdown")
+                    .line_number(false)
+                    .folding(false)
+                    .default_value(source.clone())
+            });
+            let content = cx.new(|_| MarkdownEditorTest {
+                state,
+                mode: MarkdownMode::LivePreview,
+                readonly: false,
+                content_padding: None,
+            });
+            crate::Root::new(content, window, cx)
+        });
+        let state = view.read_with(cx, |view, cx| {
+            view.view()
+                .clone()
+                .downcast::<MarkdownEditorTest>()
+                .unwrap()
+                .read(cx)
+                .state
+                .clone()
+        });
+        cx.update(|window, cx| window.draw(cx).clear());
+        assert!(
+            state
+                .read_with(cx, |state, _| state.range_to_bounds(&(0..5)))
+                .is_some()
+        );
+        let end = source.len();
+        cx.update(|window, cx| {
+            state.update(cx, |state, cx| {
+                state.set_selected_range(end..end, cx);
+                state.focus(window, cx);
+            })
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| window.draw(cx).clear());
+        cx.update(|window, cx| window.draw(cx).clear());
+        state.read_with(cx, |state, _| {
+            assert!(state.range_to_bounds(&(end..end)).is_some());
+            // The task scrolled out: neither its checkbox nor any other
+            // off-screen range resolves to the first visible line.
+            assert_eq!(state.range_to_bounds(&(0..5)), None);
+        });
+    }
+
+    #[gpui::test]
+    fn range_over_a_rendered_heading_spans_its_block(cx: &mut TestAppContext) {
+        cx.update(crate::init);
+        let source = "intro\n# Heading 🌲 é\nend";
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            let state = cx.new(|cx| {
+                EditorState::new(window, cx)
+                    .language("markdown")
+                    .line_number(false)
+                    .folding(false)
+                    .default_value(source)
+            });
+            let content = cx.new(|_| MarkdownEditorTest {
+                state,
+                mode: MarkdownMode::LivePreview,
+                readonly: false,
+                content_padding: None,
+            });
+            crate::Root::new(content, window, cx)
+        });
+        let state = view.read_with(cx, |view, cx| {
+            view.view()
+                .clone()
+                .downcast::<MarkdownEditorTest>()
+                .unwrap()
+                .read(cx)
+                .state
+                .clone()
+        });
+        cx.update(|window, cx| window.draw(cx).clear());
+        cx.update(|window, cx| window.draw(cx).clear());
+        let heading = source.find('#').unwrap()..source.find("\nend").unwrap();
+        let next = source.find("end").unwrap();
+        state.read_with(cx, |state, _| {
+            let block = state.range_to_bounds(&heading).expect("heading laid out");
+            let start = state
+                .range_to_bounds(&(heading.start..heading.start))
+                .unwrap();
+            let next = state.range_to_bounds(&(next..next)).unwrap();
+            assert_eq!(block.top(), start.top());
+            // The range ends inside the block, not on the following line.
+            assert!(block.bottom() <= next.top());
+            assert!(block.size.height >= start.size.height);
+        });
+    }
+
     fn projected(source: &str, selection: Range<usize>, focused: bool) -> String {
         let document = MarkdownDocument::parse(source);
         let mut output = source.to_string();
