@@ -34,7 +34,7 @@ pub use gpui_base::input::{EditorMode, InputMode, InputModeKind, TextareaMode};
 #[doc(hidden)]
 mod editor;
 mod markdown;
-pub use markdown::MarkdownMode;
+pub use markdown::{MarkdownMode, top_inset_y};
 mod state;
 mod textarea;
 pub use editor::Editor;

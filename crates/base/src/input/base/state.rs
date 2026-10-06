@@ -293,6 +293,8 @@ pub struct InputBaseState<M: InputModeKind> {
     pub(super) soft_wrap: bool,
     pub(super) wrapping_indent: WrappingIndent,
     pub(super) scroll_beyond_last_line: Option<usize>,
+    /// Space above the first row that scrolls with the content.
+    pub(super) top_inset: Pixels,
     pub(super) cursor_surrounding_lines: Option<usize>,
     pub(super) blink_cursor: Entity<BlinkCursor>,
     pub(super) loading: bool,
@@ -600,6 +602,7 @@ impl<M: InputModeKind> InputBaseState<M> {
             soft_wrap: true,
             wrapping_indent: WrappingIndent::default(),
             scroll_beyond_last_line: None,
+            top_inset: px(0.),
             cursor_surrounding_lines: None,
             blink_cursor,
             undo_manager,
@@ -1067,6 +1070,44 @@ impl<M: InputModeKind> InputBaseState<M> {
             return;
         }
         self.scroll_beyond_last_line = rows;
+        cx.notify();
+    }
+
+    /// Space reserved above the first row, inside the scrollable content,
+    /// multi-line only. Unlike the input's top padding, it scrolls away
+    /// with the text, so a host can lay a document header over it (as
+    /// CodeMirror content padding holding a header element).
+    pub fn top_inset(&self) -> Pixels {
+        self.top_inset
+    }
+
+    /// The [`Self::top_inset`] in effect: single-line inputs have none.
+    pub(super) fn content_top_inset(&self) -> Pixels {
+        if self.is_single_line() {
+            px(0.)
+        } else {
+            self.top_inset
+        }
+    }
+
+    /// Update [`Self::top_inset`]. The rows keep their screen position
+    /// while the view is scrolled past the inset; at the top the text moves
+    /// with the inset.
+    pub fn set_top_inset(&mut self, inset: Pixels, cx: &mut Context<Self>) {
+        let inset = inset.max(px(0.));
+        if self.top_inset == inset {
+            return;
+        }
+        let offset = self.scroll_handle.offset();
+        // Compare as f32: the resting offset may be -0, which `Pixels`
+        // orders below zero.
+        if f32::from(offset.y) < 0. {
+            // Shift by the change so the text under the viewport stays put.
+            let delta = inset - self.top_inset;
+            self.scroll_handle
+                .set_offset(point(offset.x, (offset.y - delta).min(px(0.))));
+        }
+        self.top_inset = inset;
         cx.notify();
     }
 
@@ -1871,7 +1912,8 @@ impl<M: InputModeKind> InputBaseState<M> {
         let row = point.row;
 
         // Calculate row offset by multiplying the number of lines before it with the line height
-        let mut row_offset_y = line_height * self.display_map.buffer_line_to_display_row(row);
+        let mut row_offset_y = self.content_top_inset()
+            + line_height * self.display_map.buffer_line_to_display_row(row);
 
         // For Right alignment use 0 margin: the cursor indicator is clamped inside bounds
         // in layout_cursor, so shifting the text here would cause a first-click visual jump.

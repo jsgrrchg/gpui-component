@@ -246,6 +246,15 @@ impl TextViewState {
         cx.notify();
     }
 
+    /// The scrolling list's last viewport and its scroll offset (negative
+    /// `y` as content scrolls up).
+    pub(crate) fn list_scroll(&self) -> (gpui::Bounds<Pixels>, gpui::Point<Pixels>) {
+        (
+            self.list_state.viewport_bounds(),
+            self.list_state.scroll_px_offset_for_scrollbar(),
+        )
+    }
+
     /// Set the text content.
     pub fn set_text(&mut self, text: &str, cx: &mut Context<Self>) {
         if self.text.as_str() == text {

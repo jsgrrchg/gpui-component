@@ -11,7 +11,7 @@ use gpui::{
     App, BorderStyle, Bounds, ContentMask, Context, Edges, Entity, EntityInputHandler, FontStyle,
     FontWeight, HighlightStyle, InteractiveElement, IntoElement, MouseButton, MouseDownEvent,
     ParentElement, Pixels, Render, SharedString, Styled, Subscription, TransformationMatrix,
-    WeakEntity, Window, canvas, div, point, prelude::FluentBuilder as _, px, quad, rems, size,
+    WeakEntity, Window, canvas, div, point, px, quad, rems, size,
 };
 use gpui_base::input::{
     DisplayReplacement, EditorDisplay, EditorDisplayBlock, EditorDisplayBlockCache,
@@ -23,7 +23,7 @@ use super::EditorState;
 use crate::text::incremental::{MarkdownEdit, MarkdownIndex, ReparsedMarkdown};
 use crate::{
     ActiveTheme, IconName, IconNamed as _,
-    text::{MarkdownNotes, TableAppearance, TextView, TextViewStyle},
+    text::{MarkdownNotes, TableAppearance, TextView, TextViewState, TextViewStyle},
 };
 
 static NEXT_BLOCK_ID: AtomicU64 = AtomicU64::new(1);
@@ -63,7 +63,7 @@ pub(super) struct MarkdownReadingPreview {
     _subscription: Subscription,
     _observation: Subscription,
     text: super::Rope,
-    source: SharedString,
+    view: Entity<TextViewState>,
     content_padding: Option<Edges<Pixels>>,
 }
 
@@ -80,6 +80,40 @@ impl MarkdownReadingPreview {
     }
 }
 
+/// Window y of the top of the editor's [`EditorState::top_inset`] in `mode`,
+/// where a host lays a document header that scrolls with the text. `None`
+/// before the view has been laid out.
+pub fn top_inset_y(
+    state: &Entity<EditorState>,
+    mode: MarkdownMode,
+    window: &mut Window,
+    cx: &mut App,
+) -> Option<Pixels> {
+    let _ = window;
+    if mode == MarkdownMode::Preview {
+        let preview = cx
+            .try_global::<ReadingPreviews>()?
+            .0
+            .get(&state.entity_id())?
+            .upgrade()?;
+        let preview = preview.read(cx);
+        let top = preview
+            .content_padding
+            .map_or(px(0.), |padding| padding.top);
+        let (viewport, scroll) = preview.view.read(cx).list_scroll();
+        return (viewport.size.height > px(0.)).then(|| viewport.top() + top + scroll.y);
+    }
+    let state = state.read(cx);
+    state.line_height()?;
+    Some(state.input_bounds().top() + state.scroll_offset().y)
+}
+
+/// Reading views by editor, so hosts can query their scroll outside a draw.
+#[derive(Default)]
+struct ReadingPreviews(HashMap<gpui::EntityId, WeakEntity<MarkdownReadingPreview>>);
+
+impl gpui::Global for ReadingPreviews {}
+
 pub(super) fn reading_preview(
     state: &Entity<EditorState>,
     window: &mut Window,
@@ -90,6 +124,10 @@ pub(super) fn reading_preview(
         ("markdown-reading-preview", state.entity_id()),
         cx,
         move |_, cx| {
+            let preview = cx.entity().downgrade();
+            let previews = &mut cx.default_global::<ReadingPreviews>().0;
+            previews.retain(|_, preview| preview.upgrade().is_some());
+            previews.insert(state.entity_id(), preview);
             let subscription = cx.subscribe(&state, |_, _, event: &super::InputEvent, cx| {
                 if matches!(event, super::InputEvent::Change) {
                     cx.notify();
@@ -99,7 +137,7 @@ pub(super) fn reading_preview(
                 _observation: cx.observe(&state, |_, _, cx| cx.notify()),
                 state,
                 text: super::Rope::new(),
-                source: SharedString::default(),
+                view: gpui::AppContext::new(cx, |cx| TextViewState::markdown("", cx)),
                 content_padding: None,
                 _subscription: subscription,
             }
@@ -114,23 +152,26 @@ impl Render for MarkdownReadingPreview {
             let display = display.borrow();
             (display.image_root.clone(), display.notes.clone())
         };
-        let text = self.state.read(cx).text();
-        if !ropey::extra::esoterica::ropes_are_instances(&self.text, text) {
-            self.source = text.to_string().into();
-            self.text = text.clone();
+        let text = self.state.read(cx).text().clone();
+        if !ropey::extra::esoterica::ropes_are_instances(&self.text, &text) {
+            let source = text.to_string();
+            self.text = text;
+            self.view.update(cx, |view, cx| view.set_text(&source, cx));
         }
-        TextView::markdown(
-            SharedString::from(format!("markdown-preview-{:?}", self.state.entity_id())),
-            self.source.clone(),
-        )
-        .style(markdown_style(cx, &image_root, &notes))
-        .markdown_extensions(code_block::extensions())
-        .selectable(true)
-        .scrollable(true)
-        .when_some(self.content_padding, |view, padding| {
-            view.content_padding(padding)
-        })
-        .size_full()
+        // The list's vertical padding scrolls with its rows, so the top
+        // inset is extra top padding here.
+        let inset = self.state.read(cx).top_inset();
+        let padding = self.content_padding.unwrap_or_default();
+        TextView::new(&self.view)
+            .style(markdown_style(cx, &image_root, &notes))
+            .markdown_extensions(code_block::extensions())
+            .selectable(true)
+            .scrollable(true)
+            .content_padding(Edges {
+                top: padding.top + inset,
+                ..padding
+            })
+            .size_full()
     }
 }
 
@@ -1541,7 +1582,10 @@ impl EditorDisplayProvider for MarkdownDisplay {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gpui::{AppContext, Context, Render, TestAppContext, VisualTestContext, point};
+    use gpui::{
+        AppContext, Context, Render, TestAppContext, VisualTestContext, point,
+        prelude::FluentBuilder as _,
+    };
 
     thread_local! {
         pub(super) static LAST_DISPLAY: RefCell<Weak<RefCell<MarkdownDisplay>>> = const { RefCell::new(Weak::new()) };
@@ -2451,6 +2495,82 @@ mod tests {
             state.update(cx, |state, cx| {
                 state.set_scroll_offset(point(px(0.), px(0.)), cx)
             });
+        }
+    }
+
+    #[gpui::test]
+    fn top_inset_scrolls_away_with_the_text(cx: &mut TestAppContext) {
+        cx.update(crate::init);
+        let source = (0..80)
+            .map(|line| format!("Paragraph {line} long enough to wrap inside a narrow column.\n\n"))
+            .collect::<String>();
+        let (view, state, cx) = editor(cx, &source);
+        let inset = px(120.);
+        let wheel = |cx: &mut VisualTestContext, frame: Bounds<Pixels>, dy: f32| {
+            cx.simulate_event(gpui::ScrollWheelEvent {
+                position: point(frame.left() + px(40.), frame.top() + px(200.)),
+                delta: gpui::ScrollDelta::Pixels(point(px(0.), px(dy))),
+                ..Default::default()
+            });
+            redraw(cx);
+        };
+        let inset_y = |cx: &mut VisualTestContext, mode| {
+            cx.update(|window, cx| super::top_inset_y(&state, mode, window, cx))
+                .unwrap()
+        };
+        let first_row = |cx: &mut VisualTestContext| {
+            state.read_with(cx, |state, _| {
+                state.range_to_bounds(&(0..0)).map(|b| b.top())
+            })
+        };
+        for mode in [
+            MarkdownMode::LivePreview,
+            MarkdownMode::Source,
+            MarkdownMode::Preview,
+        ] {
+            view.update(cx, |view, cx| {
+                view.mode = mode;
+                view.content_padding = Some(Edges::all(px(8.)));
+                cx.notify();
+            });
+            state.update(cx, |state, cx| state.set_top_inset(inset, cx));
+            redraw(cx);
+            let frame = cx.debug_bounds("markdown-test-editor").unwrap();
+            // Below the top padding, inside the input's 1px frame (the
+            // reading view has none).
+            let border = if mode == MarkdownMode::Preview {
+                px(0.)
+            } else {
+                px(1.)
+            };
+            let top = inset_y(cx, mode);
+            assert_eq!(top, frame.top() + border + px(8.), "{mode:?}");
+            if mode != MarkdownMode::Preview {
+                assert_eq!(first_row(cx), Some(top + inset), "{mode:?}");
+            }
+            wheel(cx, frame, -50.);
+            let scrolled = inset_y(cx, mode);
+            assert_eq!(scrolled, top - px(50.), "{mode:?}");
+            if mode != MarkdownMode::Preview {
+                assert_eq!(first_row(cx), Some(scrolled + inset), "{mode:?}");
+                // Changing the inset while scrolled keeps the text in place.
+                wheel(cx, frame, -400.);
+                let line = source.find("Paragraph 12").unwrap();
+                let before = state.read_with(cx, |state, _| state.range_to_bounds(&(line..line)));
+                state.update(cx, |state, cx| state.set_top_inset(inset + px(40.), cx));
+                redraw(cx);
+                let after = state.read_with(cx, |state, _| state.range_to_bounds(&(line..line)));
+                assert!(before.is_some(), "{mode:?}");
+                assert_eq!(before, after, "{mode:?}");
+                state.update(cx, |state, cx| {
+                    state.set_scroll_offset(point(px(0.), px(0.)), cx)
+                });
+            } else {
+                wheel(cx, frame, 1000.);
+            }
+            state.update(cx, |state, cx| state.set_top_inset(px(0.), cx));
+            redraw(cx);
+            assert_eq!(inset_y(cx, mode), top, "{mode:?}");
         }
     }
 

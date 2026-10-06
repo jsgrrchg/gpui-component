@@ -513,7 +513,8 @@ impl<M: InputModeKind> TextElement<M> {
         let visible_buffer_lines = &last_layout.visible_buffer_lines;
         let caret_for = |row: usize, offset: usize, affinity: bool| -> Point<Pixels> {
             // y of the top of buffer line `row` in content space.
-            let top = line_height * state.display_map.buffer_line_to_display_row(row);
+            let top = state.content_top_inset()
+                + line_height * state.display_map.buffer_line_to_display_row(row);
             let line_origin = point(px(0.), top);
 
             if let Some(vi) = visible_buffer_lines.iter().position(|&bl| bl == row) {
@@ -944,10 +945,11 @@ impl<M: InputModeKind> TextElement<M> {
             input_height,
         );
 
-        // Display rows are uniformly `line_height` tall, so the visible window maps
-        // directly to a display-row range.
-        let viewport_top = (-scroll_top).max(px(0.));
-        let viewport_bottom = viewport_top + input_height;
+        // Display rows are uniformly `line_height` tall below the top inset,
+        // so the visible window maps directly to a display-row range.
+        let inset = state.content_top_inset();
+        let viewport_top = (-scroll_top - inset).max(px(0.));
+        let viewport_bottom = (-scroll_top - inset + input_height).max(px(0.));
         let line_height_f = f32::from(line_height);
         let first_display =
             ((f32::from(viewport_top) / line_height_f).floor() as usize).min(display_count - 1);
@@ -962,8 +964,8 @@ impl<M: InputModeKind> TextElement<M> {
             .display_map
             .buffer_line_to_display_row_range(start_line)
         {
-            Some(range) => line_height * range.start,
-            None => line_height * first_display,
+            Some(range) => inset + line_height * range.start,
+            None => inset + line_height * first_display,
         };
 
         let visible_range = start_line..(end_line + 1 + extra_rows).min(buffer_line_count);
@@ -1882,7 +1884,8 @@ impl<M: InputModeKind> Element for TextElement<M> {
                     return None;
                 }
                 let scroll = state.scroll_handle.offset();
-                let top = (f32::from(-scroll.y) / f32::from(line_height))
+                let inset = state.content_top_inset();
+                let top = (f32::from(-scroll.y - inset) / f32::from(line_height))
                     .floor()
                     .max(0.) as usize;
                 let mut line = state
@@ -1894,8 +1897,9 @@ impl<M: InputModeKind> Element for TextElement<M> {
                 {
                     line = block.lines.start;
                 }
-                let screen_y =
-                    scroll.y + line_height * state.display_map.buffer_line_to_display_row(line);
+                let screen_y = scroll.y
+                    + inset
+                    + line_height * state.display_map.buffer_line_to_display_row(line);
                 Some((line, screen_y, scroll.x))
             });
             let changed = state.display_map.set_projection(
@@ -1912,6 +1916,7 @@ impl<M: InputModeKind> Element for TextElement<M> {
                 && let Some((line, screen_y, x)) = anchor
             {
                 let y = (screen_y
+                    - state.content_top_inset()
                     - line_height * state.display_map.buffer_line_to_display_row(line))
                 .min(px(0.));
                 state.scroll_handle.set_offset(point(x, y));
@@ -2111,7 +2116,8 @@ impl<M: InputModeKind> Element for TextElement<M> {
             } else {
                 longest_line_width
             },
-            (total_wrapped_lines as f32 * line_height
+            (state.content_top_inset()
+                + total_wrapped_lines as f32 * line_height
                 + empty_bottom_height.max(ghost_lines_height))
             .max(bounds.size.height),
         );
@@ -2269,12 +2275,9 @@ impl<M: InputModeKind> Element for TextElement<M> {
                     }
                     element
                 };
-                let y = line_height
-                    * self
-                        .state
-                        .read(cx)
-                        .display_map
-                        .buffer_line_to_display_row(line);
+                let state = self.state.read(cx);
+                let y = state.content_top_inset()
+                    + line_height * state.display_map.buffer_line_to_display_row(line);
                 window.with_content_mask(
                     Some(ContentMask {
                         bounds: content_bounds,
