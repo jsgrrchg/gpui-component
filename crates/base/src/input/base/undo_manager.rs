@@ -169,6 +169,16 @@ impl UndoManager {
     pub(super) fn has_undos(&self) -> bool {
         !self.undo_transactions.is_empty()
     }
+
+    /// Whether [`Self::undo`] would change the text: a recorded transaction
+    /// or an open one it commits first.
+    pub(super) fn can_undo(&self) -> bool {
+        !self.undo_transactions.is_empty() || self.pending_change.is_some()
+    }
+
+    pub(super) fn can_redo(&self) -> bool {
+        !self.redo_transactions.is_empty()
+    }
 }
 
 fn is_adjacent(intent: EditIntent, previous: &Change, current: &Change) -> bool {

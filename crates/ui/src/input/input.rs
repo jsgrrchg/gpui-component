@@ -133,7 +133,24 @@ pub struct Input {
     ///
     /// If set, this overrides the built-in context menu.
     context_menu_builder: Option<Rc<dyn Fn(NativeMenu, &mut Window, &mut App) -> NativeMenu>>,
+
+    /// An optional host handler that presents its own right-click menu.
+    ///
+    /// If set, it replaces the native menu (and [`Self::context_menu`]).
+    context_menu_handler: Option<ContextMenuHandler>,
 }
+
+/// Receives a right-click with the input's capabilities and the window
+/// position, after the input has placed its caret; see
+/// [`Input::on_context_menu`].
+pub type ContextMenuHandler = Rc<
+    dyn Fn(
+        gpui_base::input::InputContextMenuCapabilities,
+        gpui::Point<Pixels>,
+        &mut Window,
+        &mut App,
+    ),
+>;
 
 impl Sizable for Input {
     fn with_size(mut self, size: impl Into<Size>) -> Self {
@@ -201,6 +218,7 @@ impl Input {
             aria_label: None,
             content_padding: None,
             context_menu_builder: None,
+            context_menu_handler: None,
         }
     }
 
@@ -326,6 +344,25 @@ impl Input {
         self
     }
 
+    /// Present the right-click menu in the host instead of a native OS menu.
+    ///
+    /// The handler receives what the menu may offer (selection, editability,
+    /// Undo/Redo, code actions) and the window position; it dispatches the
+    /// input's actions (Cut, Copy, Paste, Undo…) to apply them. The input
+    /// has already moved its caret to the click unless it hit the selection.
+    pub fn on_context_menu(
+        mut self,
+        f: impl Fn(
+            gpui_base::input::InputContextMenuCapabilities,
+            gpui::Point<Pixels>,
+            &mut Window,
+            &mut App,
+        ) + 'static,
+    ) -> Self {
+        self.context_menu_handler = Some(Rc::new(f));
+        self
+    }
+
     fn render_toggle_mask_button(state: &TextInputState, cx: &App) -> impl IntoElement {
         let masked = state.presentation(cx).is_masked();
         Button::new("toggle-mask")
@@ -437,8 +474,13 @@ impl RenderOnce for Input {
         state.set_readonly(self.readonly, cx);
         state.set_text_align(text_align, cx);
         let custom = self.context_menu_builder.clone();
+        let host = self.context_menu_handler.clone();
         state.on_context_menu(
             Rc::new(move |_, capabilities, position, window, cx| {
+                if let Some(host) = host.as_ref() {
+                    host(capabilities, position, window, cx);
+                    return;
+                }
                 let menu = if let Some(custom) = custom.as_ref() {
                     custom(NativeMenu::new(), window, cx)
                 } else {

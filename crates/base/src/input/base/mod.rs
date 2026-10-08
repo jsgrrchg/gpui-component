@@ -29,6 +29,8 @@ pub struct InputContextMenuCapabilities {
     selection: bool,
     go_to_definition: bool,
     code_actions: bool,
+    undo: bool,
+    redo: bool,
 }
 
 impl InputContextMenuCapabilities {
@@ -67,6 +69,18 @@ impl InputContextMenuCapabilities {
         self
     }
 
+    /// Set whether Undo would change the text.
+    pub fn undo(mut self, undo: bool) -> Self {
+        self.undo = undo;
+        self
+    }
+
+    /// Set whether Redo would change the text.
+    pub fn redo(mut self, redo: bool) -> Self {
+        self.redo = redo;
+        self
+    }
+
     pub fn is_disabled(&self) -> bool {
         self.disabled
     }
@@ -97,6 +111,16 @@ impl InputContextMenuCapabilities {
 
     pub fn has_code_actions(&self) -> bool {
         self.code_actions
+    }
+
+    /// Whether Undo applies: the input is editable and has history.
+    pub fn can_undo(&self) -> bool {
+        self.is_editable() && self.undo
+    }
+
+    /// Whether Redo applies: the input is editable and has undone edits.
+    pub fn can_redo(&self) -> bool {
+        self.is_editable() && self.redo
     }
 }
 

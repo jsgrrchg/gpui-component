@@ -2574,6 +2574,102 @@ mod tests {
         }
     }
 
+    #[gpui::test]
+    fn host_context_menu_receives_editing_capabilities(cx: &mut TestAppContext) {
+        use gpui_base::input::InputContextMenuCapabilities;
+        type Calls = Rc<RefCell<Vec<(InputContextMenuCapabilities, gpui::Point<Pixels>)>>>;
+        struct HostMenu {
+            state: Entity<EditorState>,
+            calls: Calls,
+        }
+        impl Render for HostMenu {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                let calls = self.calls.clone();
+                div().w(px(500.)).h(px(300.)).child(
+                    super::super::Editor::new(&self.state)
+                        .markdown_mode(MarkdownMode::Source)
+                        .on_context_menu(move |capabilities, position, _, _| {
+                            calls.borrow_mut().push((capabilities, position));
+                        })
+                        .size_full(),
+                )
+            }
+        }
+        cx.update(crate::init);
+        let calls = Calls::default();
+        let host_calls = calls.clone();
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            let state = cx.new(|cx| {
+                EditorState::new(window, cx)
+                    .language("markdown")
+                    .line_number(false)
+                    .default_value("alpha beta")
+            });
+            let content = cx.new(|_| HostMenu {
+                state,
+                calls: host_calls,
+            });
+            crate::Root::new(content, window, cx)
+        });
+        let state = view.read_with(cx, |view, cx| {
+            view.view()
+                .clone()
+                .downcast::<HostMenu>()
+                .unwrap()
+                .read(cx)
+                .state
+                .clone()
+        });
+        redraw(cx);
+        let right_click = |cx: &mut VisualTestContext, at: gpui::Point<Pixels>| {
+            cx.simulate_mouse_down(at, gpui::MouseButton::Right, gpui::Modifiers::default());
+            cx.simulate_mouse_up(at, gpui::MouseButton::Right, gpui::Modifiers::default());
+            redraw(cx);
+        };
+        let beta = state
+            .read_with(cx, |state, _| state.range_to_bounds(&(7..8)))
+            .unwrap()
+            .center();
+        right_click(cx, beta);
+        {
+            let calls = calls.borrow();
+            assert_eq!(calls.len(), 1);
+            let (capabilities, position) = calls[0];
+            assert_eq!(position, beta);
+            assert!(capabilities.is_editable());
+            assert!(!capabilities.has_selection());
+            assert!(!capabilities.can_undo());
+            assert!(!capabilities.can_redo());
+        }
+        // The caret moved to the click, as for the built-in menu.
+        let caret = state.read_with(cx, |state, _| state.selected_range());
+        assert_eq!(caret.start, caret.end);
+        assert!((6..=8).contains(&caret.start));
+        cx.update(|window, cx| {
+            state.update(cx, |state, cx| {
+                state.focus(window, cx);
+                state.set_selected_range(0..5, cx);
+            })
+        });
+        cx.simulate_input("A");
+        cx.update(|window, cx| {
+            state.update(cx, |state, cx| state.set_selected_range(0..2, cx));
+            let _ = window;
+        });
+        redraw(cx);
+        let first = state
+            .read_with(cx, |state, _| state.range_to_bounds(&(0..1)))
+            .unwrap()
+            .center();
+        right_click(cx, first);
+        let (capabilities, _) = calls.borrow()[1];
+        // A click inside the selection keeps it.
+        assert!(capabilities.has_selection());
+        assert!(capabilities.can_undo());
+        assert!(!capabilities.can_redo());
+        assert_eq!(state.read_with(cx, |state, _| state.selected_range()), 0..2);
+    }
+
     pub(super) fn redraw(cx: &mut VisualTestContext) {
         cx.run_until_parked();
         cx.update(|window, cx| window.draw(cx).clear());

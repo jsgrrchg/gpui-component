@@ -535,6 +535,8 @@ impl<M: InputModeKind> InputBaseState<M> {
             .selection(!self.selected_range.is_empty())
             .go_to_definition(go_to_definition)
             .code_actions(code_actions)
+            .undo(self.undo_manager.can_undo())
+            .redo(self.undo_manager.can_redo())
     }
 
     pub fn set_text_align(&mut self, text_align: TextAlign, cx: &mut Context<Self>) {

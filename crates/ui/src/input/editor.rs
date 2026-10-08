@@ -31,6 +31,7 @@ pub struct Editor {
     ///
     /// If set, this overrides the built-in context menu.
     context_menu_builder: Option<Rc<dyn Fn(NativeMenu, &mut Window, &mut App) -> NativeMenu>>,
+    context_menu_handler: Option<super::ContextMenuHandler>,
 }
 
 impl Editor {
@@ -51,6 +52,7 @@ impl Editor {
             role: RoleOverride::default(),
             aria_label: None,
             context_menu_builder: None,
+            context_menu_handler: None,
         }
     }
 
@@ -140,6 +142,21 @@ impl Editor {
         self.context_menu_builder = Some(Rc::new(f));
         self
     }
+
+    /// Present the right-click menu in the host; see
+    /// [`super::Input::on_context_menu`].
+    pub fn on_context_menu(
+        mut self,
+        f: impl Fn(
+            gpui_base::input::InputContextMenuCapabilities,
+            gpui::Point<Pixels>,
+            &mut Window,
+            &mut App,
+        ) + 'static,
+    ) -> Self {
+        self.context_menu_handler = Some(Rc::new(f));
+        self
+    }
 }
 
 impl Styled for Editor {
@@ -195,6 +212,11 @@ impl RenderOnce for Editor {
             .when_some(self.aria_label, |this, label| this.aria_label(label))
             .when_some(self.context_menu_builder, |this, build| {
                 this.context_menu(move |menu, window, cx| build(menu, window, cx))
+            })
+            .when_some(self.context_menu_handler, |this, handler| {
+                this.on_context_menu(move |capabilities, position, window, cx| {
+                    handler(capabilities, position, window, cx)
+                })
             });
         let Some(task_mouse_down) = task_mouse_down else {
             return input
