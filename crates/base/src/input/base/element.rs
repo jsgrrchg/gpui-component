@@ -1864,6 +1864,17 @@ impl<M: InputModeKind> Element for TextElement<M> {
                 block.cache.clone(),
             ));
         }
+        // Hidden lines reserve no rows, like a block's continuation lines.
+        for range in self.display.hidden.iter().filter(|range| !range.is_empty()) {
+            let first_line = text.offset_to_point(range.start).row;
+            // Hidden ranges end at a line end, which may be an empty line.
+            let last_line = text.offset_to_point(range.end).row;
+            block_layouts.push(crate::input::display::DisplayBlockLayout {
+                lines: first_line..last_line + 1,
+                rows: 0,
+            });
+        }
+        block_layouts.sort_by_key(|block| block.lines.start);
         let state = self.state.read(cx);
         let wrap_width_changed = state
             .last_layout

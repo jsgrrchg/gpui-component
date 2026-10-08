@@ -90,6 +90,25 @@ impl<M: InputModeKind> InputBaseState<M> {
         let target_display_row = current_display_row
             .saturating_add_signed(move_lines)
             .min(max_display_row);
+        // Up from the first row with source lines above that take no rows (a
+        // host hid them): enter the line above, so the presentation can reveal
+        // it. Folds and block continuations always follow a visible row, so
+        // only hidden lines can precede the first one.
+        if move_lines < 0 && target_display_row == current_display_row {
+            let row = self.text.offset_to_point(offset).row;
+            if let Some(above) = row.checked_sub(1)
+                && self
+                    .display_map
+                    .visible_wrap_row_count_for_buffer_line(above)
+                    == 0
+            {
+                self.pause_blink_cursor(cx);
+                self.move_to(self.text.line_end_offset(above), None, cx);
+                self.preferred_column = was_preferred_column;
+                cx.notify();
+                return;
+            }
+        }
         let target_wrap_row = self
             .display_map
             .display_row_to_wrap_row(target_display_row)

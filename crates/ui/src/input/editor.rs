@@ -22,6 +22,7 @@ pub struct Editor {
     markdown_mode: Option<MarkdownMode>,
     markdown_image_root: Option<PathBuf>,
     markdown_notes: Option<crate::text::MarkdownNotes>,
+    markdown_hidden: Vec<std::ops::Range<usize>>,
     content_padding: Option<Edges<Pixels>>,
     tab_index: isize,
     role: RoleOverride,
@@ -47,6 +48,7 @@ impl Editor {
             markdown_mode: None,
             markdown_image_root: None,
             markdown_notes: None,
+            markdown_hidden: Vec::new(),
             content_padding: None,
             tab_index: 0,
             role: RoleOverride::default(),
@@ -131,6 +133,16 @@ impl Editor {
         self
     }
 
+    /// Hide whole source lines in Live Preview while the selection stays off
+    /// them, for content the host shows elsewhere (such as a note's
+    /// frontmatter and title in its header). Ranges are UTF-8 byte ranges
+    /// from a line start to a line end; a caret or selection on them reveals
+    /// them. Source mode and the reading view show everything.
+    pub fn markdown_hidden_lines(mut self, ranges: Vec<std::ops::Range<usize>>) -> Self {
+        self.markdown_hidden = ranges;
+        self
+    }
+
     /// Replace the built-in context menu shown on right-click.
     ///
     /// The closure receives an empty menu and returns the one to show, so it
@@ -174,6 +186,7 @@ impl RenderOnce for Editor {
             if let Some(notes) = self.markdown_notes {
                 super::markdown::set_notes(&self.state, notes, window, cx);
             }
+            super::markdown::set_hidden(&self.state, self.markdown_hidden, window, cx);
             if let Some(root) = self.markdown_image_root {
                 super::markdown::set_image_root(&self.state, Some(root), window, cx);
             }

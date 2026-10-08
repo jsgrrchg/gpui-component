@@ -48,6 +48,12 @@ pub struct EditorDisplay {
     pub replacements: Vec<DisplayReplacement>,
     pub decorations: Vec<TextDecoration>,
     pub blocks: Vec<EditorDisplayBlock>,
+    /// Source ranges whose whole lines take no rows and render nothing, for
+    /// content a host shows elsewhere (such as a note's title). Each range
+    /// runs from a line start to a line end (before its line break), so an
+    /// empty last line is included. Ranges must not overlap `blocks`. The text stays editable: positions inside have
+    /// no geometry until the provider stops hiding them.
+    pub hidden: Vec<Range<usize>>,
 }
 
 /// Provides a presentation without changing the editable document.

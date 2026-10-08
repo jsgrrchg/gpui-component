@@ -937,6 +937,7 @@ impl MarkdownDisplay {
                 task_glyphs: Vec::new(),
                 image_root: None,
                 notes: None,
+                hidden: Vec::new(),
             })
         })
     }
@@ -1003,6 +1004,9 @@ struct MarkdownDisplay {
     task_glyphs: Vec<Task>,
     image_root: Option<PathBuf>,
     notes: Option<MarkdownNotes>,
+    /// Host ranges to hide while the selection stays off their lines; see
+    /// [`set_hidden`].
+    hidden: Vec<Range<usize>>,
 }
 
 fn display_state(
@@ -1066,6 +1070,36 @@ pub(super) fn set_notes(
         }
         state.update(cx, |_, cx| cx.notify());
     }
+}
+
+/// Hide whole source lines in Live Preview while the selection stays off
+/// them, for content the host presents elsewhere (NeverWrite collapses a
+/// note's frontmatter and leading title this way). Ranges are UTF-8 byte
+/// ranges from a line start to a line end in the current text. Any caret or
+/// selection on their lines reveals them, so the caret is never inside text
+/// that is not shown; a host places the initial caret after them.
+pub(super) fn set_hidden(
+    state: &Entity<EditorState>,
+    mut hidden: Vec<Range<usize>>,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    hidden.retain(|range| !range.is_empty());
+    hidden.sort_by_key(|range| range.start);
+    let display = display_state(state, window, cx);
+    let mut display = display.borrow_mut();
+    if display.hidden != hidden {
+        display.hidden = hidden;
+        display.last_display = None;
+        state.update(cx, |_, cx| cx.notify());
+    }
+}
+
+/// Whether the selection reveals a hidden range: any selection on its lines
+/// (NeverWrite's `selectionOnLine`, without its exception for a caret at the
+/// document start, which here would leave the caret in unseen text).
+fn reveals_hidden(selection: &Range<usize>, range: &Range<usize>) -> bool {
+    touches(selection, range)
 }
 
 /// Paint the checkboxes of tasks whose marker is hidden, over the room
@@ -1202,6 +1236,20 @@ impl EditorDisplayProvider for MarkdownDisplay {
                 new_len,
             });
         }
+        // Keep host ranges on their text until the host supplies new ones.
+        let map = |offset: usize| {
+            if offset <= range.start {
+                offset
+            } else if offset >= range.end {
+                offset - range.len() + new_len
+            } else {
+                range.start + new_len
+            }
+        };
+        for hidden in &mut self.hidden {
+            *hidden = map(hidden.start)..map(hidden.end);
+        }
+        self.hidden.retain(|hidden| !hidden.is_empty());
         if ropey::extra::esoterica::ropes_are_instances(&self.text, old_text) {
             self.document.project_edit(text, range, new_len);
             self.text = text.clone();
@@ -1573,6 +1621,23 @@ impl EditorDisplayProvider for MarkdownDisplay {
                         .into_any_element()
                 }),
             });
+        }
+        let hidden: Vec<_> = self
+            .hidden
+            .iter()
+            .filter(|range| range.end <= text.len() && !reveals_hidden(&selection, range))
+            .cloned()
+            .collect();
+        if !hidden.is_empty() {
+            let overlaps = |range: &Range<usize>| {
+                hidden
+                    .iter()
+                    .any(|hidden| hidden.start < range.end && range.start < hidden.end)
+            };
+            // Hidden lines win over blocks and checkboxes drawn on them.
+            display.blocks.retain(|block| !overlaps(&block.range));
+            self.task_glyphs.retain(|task| !overlaps(&task.line));
+            display.hidden = hidden;
         }
         self.last_display = Some(display.clone());
         display
@@ -2668,6 +2733,123 @@ mod tests {
         assert!(capabilities.can_undo());
         assert!(!capabilities.can_redo());
         assert_eq!(state.read_with(cx, |state, _| state.selected_range()), 0..2);
+    }
+
+    #[gpui::test]
+    fn hidden_lines_take_no_rows_until_the_selection_reaches_them(cx: &mut TestAppContext) {
+        struct Hidden {
+            state: Entity<EditorState>,
+            mode: MarkdownMode,
+            hidden: Vec<Range<usize>>,
+        }
+        impl Render for Hidden {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                div().w(px(500.)).h(px(400.)).child(
+                    super::super::Editor::new(&self.state)
+                        .markdown_mode(self.mode)
+                        .markdown_hidden_lines(self.hidden.clone())
+                        .size_full(),
+                )
+            }
+        }
+        cx.update(crate::init);
+        // Frontmatter with its blank line, then the title with its blank line.
+        let source = "---\ntitle: X\n---\n\n# Title\n\nBody line\nmore\n";
+        let frontmatter = 0..17;
+        let title = 18..26;
+        let body = source.find("Body").unwrap();
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            let state = cx.new(|cx| {
+                EditorState::new(window, cx)
+                    .language("markdown")
+                    .line_number(false)
+                    .folding(false)
+                    .default_value(source)
+            });
+            let content = cx.new(|_| Hidden {
+                state,
+                mode: MarkdownMode::LivePreview,
+                hidden: vec![frontmatter.clone(), title.clone()],
+            });
+            crate::Root::new(content, window, cx)
+        });
+        let content = view.read_with(cx, |view, _| {
+            view.view().clone().downcast::<Hidden>().unwrap()
+        });
+        let state = content.read_with(cx, |view, _| view.state.clone());
+        // The host places the caret after the hidden lines.
+        cx.update(|_, cx| state.update(cx, |state, cx| state.set_selected_range(body..body, cx)));
+        redraw(cx);
+        redraw(cx);
+        let top = |cx: &mut VisualTestContext, offset: usize| {
+            state.read_with(cx, |state, _| {
+                state.range_to_bounds(&(offset..offset)).map(|b| b.top())
+            })
+        };
+        // The body is the first row.
+        let viewport = state.read_with(cx, |state, _| state.input_bounds());
+        assert_eq!(top(cx, 0), None);
+        assert_eq!(top(cx, title.start), None);
+        assert_eq!(top(cx, body), Some(viewport.top()));
+        // Hit testing skips the hidden lines: a click on the first row lands
+        // in the body.
+        let first_row = state
+            .read_with(cx, |state, _| state.range_to_bounds(&(body..body + 4)))
+            .unwrap();
+        cx.simulate_click(first_row.center(), gpui::Modifiers::default());
+        redraw(cx);
+        let caret = state.read_with(cx, |state, _| state.selected_range());
+        assert!(
+            caret.is_empty() && (body..body + 9).contains(&caret.start),
+            "{caret:?}"
+        );
+        assert_eq!(top(cx, title.start), None);
+        // Arrowing up from the body enters the title line and reveals it.
+        cx.update(|_, cx| state.update(cx, |state, cx| state.set_selected_range(body..body, cx)));
+        cx.simulate_keystrokes("up");
+        redraw(cx);
+        assert!(state.read_with(cx, |state, _| state.selected_range().start) < body);
+        assert!(top(cx, title.start).is_some());
+        // A caret on the title reveals only the title.
+        cx.update(|window, cx| {
+            state.update(cx, |state, cx| {
+                state.focus(window, cx);
+                state.set_selected_range(20..20, cx);
+            })
+        });
+        redraw(cx);
+        assert_eq!(top(cx, 0), None);
+        assert!(top(cx, title.start).is_some());
+        assert!(top(cx, body).unwrap() > viewport.top());
+        // Back in the body, the title hides again; editing above the body
+        // keeps the ranges on their text.
+        cx.update(|_, cx| state.update(cx, |state, cx| state.set_selected_range(body..body, cx)));
+        cx.simulate_input("New ");
+        redraw(cx);
+        assert_eq!(top(cx, title.start), None);
+        assert_eq!(top(cx, body), Some(viewport.top()));
+        assert!(
+            state
+                .read_with(cx, |state, _| state.value())
+                .starts_with("---\ntitle: X\n---\n\n# Title\n\nNew Body")
+        );
+        // A caret in the frontmatter reveals it, the document start included.
+        cx.update(|_, cx| state.update(cx, |state, cx| state.set_selected_range(5..5, cx)));
+        redraw(cx);
+        assert!(top(cx, 0).is_some());
+        assert_eq!(top(cx, title.start), None);
+        cx.update(|_, cx| state.update(cx, |state, cx| state.set_selected_range(0..0, cx)));
+        redraw(cx);
+        assert_eq!(top(cx, 0), Some(viewport.top()));
+        // Source mode shows everything.
+        content.update(cx, |view, cx| {
+            view.mode = MarkdownMode::Source;
+            cx.notify();
+        });
+        cx.update(|_, cx| state.update(cx, |state, cx| state.set_selected_range(body..body, cx)));
+        redraw(cx);
+        assert_eq!(top(cx, 0), Some(viewport.top()));
+        assert!(top(cx, title.start).is_some());
     }
 
     pub(super) fn redraw(cx: &mut VisualTestContext) {
